@@ -1,0 +1,7 @@
+is_debug = false
+target_os = "ios"
+target_cpu = "arm64"
+target_environment = "simulator"
+ios_enable_code_signing = false
+angle_enable_vulkan = false
+angle_enable_swiftshader = false

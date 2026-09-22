@@ -1,0 +1,802 @@
+angle-metal-fixes.patch — generische Fixes fürs ANGLE-Metal-Backend
+====================================================================
+(erarbeitet im Vice-City-Port für visionOS; nicht spielspezifisch)
+
+Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Reihenfolge: erst klepton.patch anwenden, dann diesen Patch (git apply).
+Erzeugt:     2026-09-21 aus dem Arbeitsbaum (Tag vc-local-state-20260921
+             im angle-src-Checkout haelt den vollstaendigen Zustand).
+
+Inhalt (drei Gruppen):
+
+1. GC-Aufschub (Rain+Foveation-Flacker-Fix, PRODUKTIV):
+   mtl_buffer_manager.{h,mm}, ContextMtl.{h,mm} —
+   BufferManagers speicherbasierter GC flusht nicht mehr mitten in einem
+   Pass mit Rate Map (Pass-Neustart + Store/Load unter Rate Map = Flackern),
+   sondern wird aufgeschoben und an der Frame-Grenze (ContextMtl::flush ->
+   runPendingGC) nachgeholt. Deckel KL_MTL_GC_DEFER_CAP_MB (Default 256),
+   Aus-Schalter KL_MTL_GC_DEFER=0, Boden-Override KL_MTL_BUFFER_GC_MB.
+
+2. Nicht-Dreieck-Skip unter Rate Map (PRODUKTIV):
+   mtl_command_buffer.{h,mm} — Metal erlaubt unter einer Rasterization Rate
+   Map nur Dreiecke; die draw*-Methoden ueberspringen Linien/Punkte statt
+   abzubrechen. (War vorher nur in angle-build.md erwaehnt, nie gesichert.)
+
+3. Diagnose-Sonden (nur aktiv mit KL_ANGLE_VRR_TRACE=1, Banner rev=10):
+   mtl_common.mm (Banner), mtl_state_cache.mm (convertToMetalDesc-Trace),
+   ContextMtl.mm (endEncoding/flushCB-Trace mit dladdr),
+   mtl_command_buffer.mm (encode/s-Replay-Timing, cmds/s-Kommandozaehlung,
+   mNumDraws), mtl_buffer_manager.mm (bufferGC-Trace).
+
+Hinweis: Der implizite MSAA-Pfad (VC_MSAA_IMPLICIT) haengt von Gruppe 1+2 ab.
+Kleptons physicalPassthrough (Rate-Map-fester Blit) liegt in klepton.patch,
+NICHT hier — und fehlt weiterhin in unresolveIfNeeded (bekannte Luecke,
+siehe Docs/vicecity/multiview-plan.md).
+
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 4ea4a3cc12..56dbd6ad0c 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -348,6 +348,11 @@ class ContextMtl : public ContextImpl, public mtl::Context
+     // pass having the same attachments, and possibly having different load/store options.
+     bool hasStartedRenderPass(const mtl::RenderPassDesc &desc);
+ 
++    // Klepton foveation: true while a render pass carrying a rasterization rate map is
++    // recording. Housekeeping that would flush the command buffer (BufferManager's
++    // memory GC) must not do so here -- see RenderCommandEncoder::hasRateMap().
++    bool inRateMappedRenderPass() const;
++
+     // Get current render encoder. May be nullptr if no render pass has been started.
+     mtl::RenderCommandEncoder *getRenderCommandEncoder();
+ 
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index ad2cd4015c..2e76f7d452 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -11,6 +11,7 @@
+ 
+ #include <TargetConditionals.h>
+ #include <cstdint>
++#include <dlfcn.h>  // Klepton: dladdr() for the endEncoding caller trace
+ 
+ #include "GLSLANG/ShaderLang.h"
+ #include "common/debug.h"
+@@ -252,6 +253,12 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     // needed. This is typically required if two MTLDevices are
+     // operating on the same IOSurface.
+     flushCommandBuffer(mtl::NoWait);
++    // Klepton foveation: THE frame boundary. flushCommandBuffer has just ended the
++    // encoder, so a GC that BufferManager postponed because a rate-mapped pass was
++    // recording can run here without chopping anything. This is what bounds the
++    // deferral to one frame; relying on "the next allocation outside a pass" was
++    // measured to be far weaker (episodes of ~500 deferrals, peak creeping to 177 MB).
++    mBufferManager.runPendingGC(this);
+     return checkCommandBufferError();
+ }
+ angle::Result ContextMtl::finish(const gl::Context *context)
+@@ -1758,6 +1765,35 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ 
+     if (mRenderEncoder.valid())
+     {
++        if (mtl::RasterizationRateTraceEnabled())
++        {
++            // Klepton: every render pass end funnels through here, so the return
++            // address names WHAT broke the pass — streaming blit, mipmap
++            // generation, flushCommandBufferIfNeeded at a draw call limit, a
++            // framebuffer switch. Reading the caller rather than threading a
++            // reason string through the ~20 call sites keeps this a diagnostic
++            // that can be deleted in one piece.
++            //
++            // off= is the offset inside the image, not the runtime address:
++            // ASLR makes the raw pointer useless in a log that outlives the
++            // process, whereas the offset feeds straight into
++            //   atos -o <libGLESv2 binary> -l 0 0x<off>
++            void *ret       = __builtin_return_address(0);
++            const char *sym = "?";
++            unsigned long off = 0;
++            Dl_info info;
++            if (dladdr(ret, &info))
++            {
++                off = (unsigned long)((const char *)ret - (const char *)info.dli_fbase);
++                if (info.dli_sname)
++                {
++                    sym = info.dli_sname;
++                }
++            }
++            fprintf(stderr, "[angle-vrr] endEncoding save=%d off=0x%lx sym=%s\n",
++                    forceSaveRenderPassContent ? 1 : 0, off, sym);
++        }
++
+         if (forceSaveRenderPassContent)
+         {
+             // Save the work in progress.
+@@ -1783,6 +1819,32 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ 
+ void ContextMtl::flushCommandBuffer(mtl::CommandBufferFinishOperation operation)
+ {
++    // Klepton: probing flushCommandBufferIfNeeded turned out to be one level
++    // too deep — it never fired, so whatever chops the in-flight render pass
++    // reaches flushCommandBuffer by another route. This sits at the choke
++    // point every route has to pass, and records the caller so the route can
++    // be named. `live` is the part that matters: a flush with no render
++    // encoder open is harmless bookkeeping, one with an encoder open is a
++    // mid-pass store/restart.
++    if (mtl::RasterizationRateTraceEnabled() && mRenderEncoder.valid())
++    {
++        void *ret       = __builtin_return_address(0);
++        const char *sym = "?";
++        unsigned long off = 0;
++        Dl_info info;
++        if (dladdr(ret, &info))
++        {
++            off = (unsigned long)((const char *)ret - (const char *)info.dli_fbase);
++            if (info.dli_sname)
++            {
++                sym = info.dli_sname;
++            }
++        }
++        fprintf(stderr, "[angle-vrr] flushCB live=1 op=%d passes=%u from off=0x%lx sym=%s\n",
++                static_cast<int>(operation), static_cast<unsigned>(mRenderPassesSinceFlush), off,
++                sym);
++    }
++
+     mRenderPassesSinceFlush = 0;
+     if (mCmdBuffer.ready())
+     {
+@@ -1798,9 +1860,23 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ 
+ void ContextMtl::flushCommandBufferIfNeeded()
+ {
+-    if (mRenderPassesSinceFlush >= mtl::kMaxRenderPassesPerCommandBuffer ||
+-        mCmdBuffer.needsFlushForDrawCallLimits())
+-    {
++    // Klepton: the two conditions are deliberately evaluated separately rather
++    // than short-circuited, so the trace can name WHICH one fired. `live` is
++    // the one that decides whether this is benign: all three callers of this
++    // function end the render encoder before calling it, so a live encoder
++    // here would contradict that reading and mean the chop comes from
++    // somewhere else entirely.
++    const bool tooManyPasses = mRenderPassesSinceFlush >= mtl::kMaxRenderPassesPerCommandBuffer;
++    const bool overBudget    = mCmdBuffer.needsFlushForDrawCallLimits();
++    if (tooManyPasses || overBudget)
++    {
++        if (mtl::RasterizationRateTraceEnabled())
++        {
++            fprintf(stderr, "[angle-vrr] flushIfNeeded passes=%u/%u overBudget=%d live=%d\n",
++                    static_cast<unsigned>(mRenderPassesSinceFlush),
++                    static_cast<unsigned>(mtl::kMaxRenderPassesPerCommandBuffer),
++                    overBudget ? 1 : 0, mRenderEncoder.valid() ? 1 : 0);
++        }
+         // Ensure that we don't accumulate too many unflushed render passes. Don't wait until they
+         // are submitted, other components handle backpressure so don't create uneccessary CPU/GPU
+         // synchronization.
+@@ -1842,6 +1918,11 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+            mRenderEncoder.renderPassDesc().equalIgnoreLoadStoreOptions(desc);
+ }
+ 
++bool ContextMtl::inRateMappedRenderPass() const
++{
++    return mRenderEncoder.valid() && mRenderEncoder.hasRateMap();
++}
++
+ bool ContextMtl::isCurrentRenderEncoderSerial(uint64_t serial)
+ {
+     if (!mRenderEncoder.valid())
+diff --git a/src/libANGLE/renderer/metal/mtl_buffer_manager.h b/src/libANGLE/renderer/metal/mtl_buffer_manager.h
+index 1e68977c68..9b2689ef1b 100644
+--- a/src/libANGLE/renderer/metal/mtl_buffer_manager.h
++++ b/src/libANGLE/renderer/metal/mtl_buffer_manager.h
+@@ -81,6 +81,14 @@ class BufferManager
+                             mtl::BufferRef &bufferRef);
+     void returnBuffer(ContextMtl *contextMtl, mtl::BufferRef &bufferRef);
+ 
++    // Klepton foveation: run a GC that was postponed because a rate-mapped pass was
++    // recording. Call this at the frame boundary (ContextMtl::flush, after the encoder
++    // has ended). Waiting for "the next allocation outside a pass" instead was measured
++    // to be a far weaker bound -- with both eye passes rate-mapped such an allocation is
++    // rare, episodes grew to ~500 deferrals and the peak crept from 142 to 177 MB.
++    // No-op when nothing is owed.
++    void runPendingGC(ContextMtl *contextMtl);
++
+     void incrementNumContextSwitches();
+     void incrementNumCommandBufferCommits();
+ 
+@@ -97,6 +105,22 @@ class BufferManager
+     void freeUnusedBuffers(ContextMtl *contextMtl);
+     void addBufferRefToFreeLists(mtl::BufferRef &bufferRef);
+     void collectGarbage(GCReason reason);
++    void runMemBasedGC(ContextMtl *contextMtl, bool lotOfMemAllocedRecently);
++
++    // Klepton foveation: set when the memory-based GC wanted to run but a render pass
++    // carrying a rasterization rate map was recording. Chopping such a pass is what
++    // produced the rain flicker, so the GC waits for the pass to close instead of
++    // being skipped -- getBuffer() picks it up on the next allocation.
++    bool mMemGCPending          = false;
++    bool mMemGCPendingWithChurn = false;
++    // Per-episode accounting, so one line at the end replaces a line per allocation:
++    // how long the pass held the GC off and how far the buffer set grew meanwhile.
++    // mMemGCPeakEver survives the episode -- it is the number that says whether the
++    // deferral stays bounded over a long run.
++    size_t mMemGCDeferCount = 0;
++    size_t mMemGCPeakMem    = 0;
++    size_t mMemGCPeakInUse  = 0;
++    size_t mMemGCPeakEver   = 0;
+ 
+     BufferList mInUseBuffers;
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_buffer_manager.mm b/src/libANGLE/renderer/metal/mtl_buffer_manager.mm
+index ee57bbbf7d..bf30c11304 100644
+--- a/src/libANGLE/renderer/metal/mtl_buffer_manager.mm
++++ b/src/libANGLE/renderer/metal/mtl_buffer_manager.mm
+@@ -10,6 +10,9 @@
+ #include "libANGLE/renderer/metal/mtl_buffer_manager.h"
+ #include "common/unsafe_buffers.h"
+ 
++#include <algorithm>  // Klepton: std::max für die Defer-Spitzenwerte
++#include <cstdlib>    // Klepton: getenv/strtoul für KL_MTL_BUFFER_GC_MB
++
+ #include "libANGLE/renderer/metal/ContextMtl.h"
+ #include "libANGLE/renderer/metal/DisplayMtl.h"
+ 
+@@ -187,11 +190,68 @@ int storageModeToCacheIndex(MTLStorageMode storageMode)
+     }
+ }
+ 
++// The flush + collect that the memory-based GC wants. Split out of getBuffer() so the
++// deferred path runs exactly the same code once the rate-mapped pass has closed.
++void BufferManager::runMemBasedGC(ContextMtl *contextMtl, bool lotOfMemAllocedRecently)
++{
++    if (mInUseBuffers.size() > 0 && lotOfMemAllocedRecently)
++    {
++        // A considerable amount of memory has been allocated since the last GC. Wait for all
++        // pending GPU work to finish in order to unreference in-flight buffers more quickly.
++        contextMtl->flushCommandBuffer(mtl::WaitUntilFinished);
++    }
++    else
++    {
++        // Flush the current command buffer so that the in-flight buffers are scheduled and will
++        // eventually become unreferenced. They won't be collected during this GC cycle but
++        // hopefully will in the next one.
++        contextMtl->flushCommandBuffer(mtl::NoWait);
++    }
++    freeUnusedBuffers(contextMtl);
++    collectGarbage(GCReason::TotalMem);
++}
++
++void BufferManager::runPendingGC(ContextMtl *contextMtl)
++{
++    if (!mMemGCPending || contextMtl->inRateMappedRenderPass())
++    {
++        return;
++    }
++
++    const bool churn       = mMemGCPendingWithChurn;
++    mMemGCPending          = false;
++    mMemGCPendingWithChurn = false;
++    if (mMemGCPeakMem > mMemGCPeakEver)
++    {
++        mMemGCPeakEver = mMemGCPeakMem;
++    }
++    if (RasterizationRateTraceEnabled())
++    {
++        // One line per episode. peak/peakEver are the numbers that matter: they say how
++        // much the buffer set grew while the pass held the GC off, and whether that stays
++        // bounded over a long run.
++        fprintf(stderr,
++                "[angle-vrr] bufferGC deferred->run deferrals=%zu peak=%zuMB/%zubufs "
++                "peakEver=%zuMB churn=%d\n",
++                mMemGCDeferCount, mMemGCPeakMem / (1024 * 1024), mMemGCPeakInUse,
++                mMemGCPeakEver / (1024 * 1024), churn ? 1 : 0);
++    }
++    mMemGCDeferCount = 0;
++    mMemGCPeakMem    = 0;
++    mMemGCPeakInUse  = 0;
++    runMemBasedGC(contextMtl, churn);
++}
++
+ angle::Result BufferManager::getBuffer(ContextMtl *contextMtl,
+                                        MTLStorageMode storageMode,
+                                        size_t size,
+                                        BufferRef &bufferRef)
+ {
++    // Second chance only. The frame boundary (ContextMtl::flush) is the primary point;
++    // this catches the case where a pass closed and the next frame boundary is still far
++    // off. Deliberately before the free-list lookup so recycled buffers serve this call.
++    runPendingGC(contextMtl);
++
+     freeUnusedBuffers(contextMtl);
+     const int cacheIndex = storageModeToCacheIndex(storageMode);
+     if (cacheIndex < kNumCachedStorageModes)
+@@ -230,25 +290,104 @@ int storageModeToCacheIndex(MTLStorageMode storageMode)
+     }
+ #endif
+ 
++    // Klepton: DIES ist der Pfad, der den laufenden Render-Pass zerhackt — der
++    // flushCB-Trace weist die Abbrüche mitten im Pass hierher zu, nicht an die
++    // 400-MB-Residenzprüfung (die feuert nie). Zwei Eigenschaften machen ihn
++    // schädlich: WaitUntilFinished hält die CPU an, bis die GPU fertig ist, und
++    // collectGarbage setzt mTotalMemAtLastGC auf den dann kleinen Restwert —
++    // wodurch die Verdopplungsbedingung gleich wieder reißt und der Zweig in
++    // Serie feuert (im Log: passes=1,1,1,2 hintereinander).
++    //
++    // kMinMemBasedGC ist der Boden, unter dem dieser Zweig gar nicht anspringt.
++    // Am Boden zu drehen ist NICHT die Lösung: gemessen hat 512 MB das Flackern
++    // genommen, 64 MB nicht — der Zweig muss also praktisch abgeschaltet werden,
++    // und dann wächst der Puffercache unkontrolliert. Der Default bleibt deshalb
++    // bei 1 MB; KL_MTL_BUFFER_GC_MB ist nur noch ein Notausgang für A/B-Tests.
++    // Die eigentliche Korrektur ist das Aufschieben unten.
++    static const size_t kMemFloor = [] {
++        const char *env        = getenv("KL_MTL_BUFFER_GC_MB");
++        const size_t megabytes = env ? static_cast<size_t>(strtoul(env, nullptr, 10)) : 0;
++        return megabytes ? megabytes * 1024 * 1024 : kMinMemBasedGC;
++    }();
++
+     bool lotOfMemAllocedRecently = (mTotalMem > mTotalMemAtLastGC + kMemAllocedBetweenGC);
+-    if (mTotalMem > kMinMemBasedGC &&
+-        (mTotalMem > 2 * mTotalMemAtLastGC || lotOfMemAllocedRecently))
++    if (mTotalMem > kMemFloor && (mTotalMem > 2 * mTotalMemAtLastGC || lotOfMemAllocedRecently))
+     {
+-        if (mInUseBuffers.size() > 0 && lotOfMemAllocedRecently)
++        // Only while nothing is owed yet -- once a defer is pending the condition stays
++        // true for every further allocation in the pass, and logging each one buried the
++        // signal in the first measurement.
++        if (RasterizationRateTraceEnabled() && !mMemGCPending)
+         {
+-            // A considerable amount of memory has been allocated since the last GC. Wait for all
+-            // pending GPU work to finish in order to unreference in-flight buffers more quickly.
+-            contextMtl->flushCommandBuffer(mtl::WaitUntilFinished);
++            fprintf(stderr,
++                    "[angle-vrr] bufferGC total=%zuMB atLastGC=%zuMB floor=%zuMB churn=%d "
++                    "inUse=%zu\n",
++                    mTotalMem / (1024 * 1024), mTotalMemAtLastGC / (1024 * 1024),
++                    kMemFloor / (1024 * 1024), lotOfMemAllocedRecently ? 1 : 0,
++                    mInUseBuffers.size());
++        }
++        // Klepton foveation: THE fix. Flushing here ends and restarts the in-flight
++        // render pass; on a pass carrying a rasterization rate map the stored and
++        // reloaded halves do not line up, which is the rain flicker (rain churns
++        // dynamic buffers hard, so this branch fires several times per frame).
++        // Postpone rather than skip: the GC still runs, just at the first allocation
++        // after the pass closed. The working set therefore grows by at most the
++        // remainder of one frame, and the memory behaviour is otherwise unchanged.
++        // KL_MTL_GC_DEFER=0 stellt das alte Verhalten wieder her (Flush mitten im Pass,
++        // also Flackern). Nur als A/B für die Kostenfrage: das Aufschieben spart
++        // Pass-Neustarts, verhindert aber das Recyceln innerhalb des Frames -- welcher
++        // der beiden Effekte überwiegt, ist eine Messung, keine Herleitung.
++        static const bool kDeferEnabled = [] {
++            const char *env = getenv("KL_MTL_GC_DEFER");
++            return !(env && env[0] == '0');
++        }();
++
++        // Zweite Sicherung. Das Aufschieben ist an die Frame-Grenze gebunden, aber falls
++        // die aus irgendeinem Grund ausbleibt, darf der Puffersatz nicht unbegrenzt
++        // wachsen. Reißt er den Deckel, wird geflusht -- ein Flackerframe ist besser als
++        // unkontrollierter Speicher. Gemessene Spitze im langen Regenlauf: 177 MB, der
++        // Deckel liegt bewusst darüber, damit er im Normalbetrieb nie greift.
++        static const size_t kDeferCap = [] {
++            const char *env        = getenv("KL_MTL_GC_DEFER_CAP_MB");
++            const size_t megabytes = env ? static_cast<size_t>(strtoul(env, nullptr, 10)) : 0;
++            return (megabytes ? megabytes : 256) * 1024 * 1024;
++        }();
++
++        const bool overDeferCap = mTotalMem > kDeferCap;
++        if (overDeferCap && RasterizationRateTraceEnabled())
++        {
++            fprintf(stderr,
++                    "[angle-vrr] bufferGC DEFER CAP HIT total=%zuMB cap=%zuMB deferrals=%zu "
++                    "-- flushing mid-pass, expect one bad frame\n",
++                    mTotalMem / (1024 * 1024), kDeferCap / (1024 * 1024), mMemGCDeferCount);
++        }
++
++        if (kDeferEnabled && !overDeferCap && contextMtl->inRateMappedRenderPass())
++        {
++            mMemGCPending = true;
++            // Sticky: once a churn-driven GC is owed, the blocking variant stays owed
++            // even if a later trigger would have been the cheap one.
++            mMemGCPendingWithChurn = mMemGCPendingWithChurn || lotOfMemAllocedRecently;
++            ++mMemGCDeferCount;
++            mMemGCPeakMem   = std::max(mMemGCPeakMem, mTotalMem);
++            mMemGCPeakInUse = std::max(mMemGCPeakInUse, mInUseBuffers.size());
+         }
+         else
+         {
+-            // Flush the current command buffer so that the in-flight buffers are scheduled and will
+-            // eventually become unreferenced. They won't be collected during this GC cycle but
+-            // hopefully will in the next one.
+-            contextMtl->flushCommandBuffer(mtl::NoWait);
++            // Wir kollektieren hier und jetzt. Eine offene Episode ist damit erledigt --
++            // sonst liefe am nächsten Frame-Ende ein zweiter, überflüssiger GC, und die
++            // Episodenzählung wäre falsch.
++            const bool churn = mMemGCPendingWithChurn || lotOfMemAllocedRecently;
++            if (mMemGCPending)
++            {
++                mMemGCPeakEver   = std::max(mMemGCPeakEver, mMemGCPeakMem);
++                mMemGCPending    = false;
++                mMemGCPendingWithChurn = false;
++                mMemGCDeferCount = 0;
++                mMemGCPeakMem    = 0;
++                mMemGCPeakInUse  = 0;
++            }
++            runMemBasedGC(contextMtl, churn);
+         }
+-        freeUnusedBuffers(contextMtl);
+-        collectGarbage(GCReason::TotalMem);
+     }
+ 
+     bufferRef = newBufferRef;
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.h b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+index 2221ba033f..e54dca6abe 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.h
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+@@ -603,6 +603,11 @@ class RenderCommandEncoder final : public CommandEncoder
+ 
+     const RenderPassDesc &renderPassDesc() const { return mRenderPassDesc; }
+     bool hasDrawCalls() const { return mHasDrawCalls; }
++    // Klepton foveation: a pass under a rate map must not be chopped in half. Ending and
++    // restarting it stores and reloads a foveated attachment, and the two halves do not
++    // line up -- measured as the rain flicker. Callers that would flush mid-pass for
++    // housekeeping ask this first and defer instead.
++    bool hasRateMap() const { return mHasRateMap; }
+ 
+     uint64_t getSerial() const { return mSerial; }
+ 
+@@ -641,6 +646,15 @@ class RenderCommandEncoder final : public CommandEncoder
+     const OcclusionQueryPool &mOcclusionQueryPool;
+     bool mRecording    = false;
+     bool mHasDrawCalls = false;
++    // Klepton: draws recorded into mCommands for THIS pass. ANGLE does not issue draws
++    // to Metal as they arrive -- it records them and replays the whole stream in
++    // encodeMetalEncoder() when the pass ENDS. So the cost of a pass lands on whoever
++    // triggers the end (for us: the framebuffer bind of the next eye, and the cinema
++    // rebind). This counter pairs the replay time with the work replayed.
++    size_t mNumDraws = 0;
++    // Klepton foveation: true while this pass has a rasterization rate map bound. Metal
++    // forbids non-triangle primitives under a rate map, so the draw* methods skip them.
++    bool mHasRateMap   = false;
+     IntermediateCommandStream mCommands;
+ 
+     gl::ShaderMap<uint8_t> mSetBufferCmds;
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index 1dd725df17..04a1be440d 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -11,7 +11,9 @@
+ #include "libANGLE/renderer/metal/mtl_command_buffer.h"
+ 
+ #include <cassert>
++#include <chrono>  // Klepton: timing the command replay in encodeMetalEncoder
+ #include <cstdint>
++#include <cstring>  // Klepton: strncmp/memset for the command-stream tally
+ #include <random>
+ #include <type_traits>
+ #include "mtl_command_buffer.h"
+@@ -963,7 +965,33 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+ 
+ bool CommandBuffer::needsFlushForDrawCallLimits() const
+ {
+-    return mWorkingResourceSize > kMaximumResidentMemorySizeInBytes;
++    // Klepton: despite the name this is a RESIDENT MEMORY check, not a draw
++    // call count — mWorkingResourceSize is the summed estimatedByteSize of
++    // every distinct resource this command buffer has touched. Crossing the
++    // budget chops the in-flight render pass (store + commit + restart), and
++    // under a rasterization rate map that round trip is a suspect for the
++    // flicker.
++    //
++    // The budget is an ANGLE policy constant, not a Metal limit: Metal imposes
++    // no obligation to commit at any working-set size. Making it overridable
++    // lets the "is the chop what breaks the picture" question be A/B'd within a
++    // single device run instead of one run per rebuild.
++    static const size_t kBudget = [] {
++        const char *env      = getenv("KL_MTL_RESIDENT_MB");
++        const size_t megabytes = env ? static_cast<size_t>(strtoul(env, nullptr, 10)) : 0;
++        return megabytes ? megabytes * 1024 * 1024 : kMaximumResidentMemorySizeInBytes;
++    }();
++
++    const bool over = mWorkingResourceSize > kBudget;
++    if (over && RasterizationRateTraceEnabled())
++    {
++        // Logged only when it actually fires, so the volume stays proportional
++        // to the problem rather than to the frame rate. How FAR over matters:
++        // the render targets alone may account for most of the budget.
++        fprintf(stderr, "[angle-vrr] residentOver working=%zuMB budget=%zuMB\n",
++                mWorkingResourceSize / (1024 * 1024), kBudget / (1024 * 1024));
++    }
++    return over;
+ }
+ 
+ uint64_t CommandBuffer::getQueueSerial() const
+@@ -1681,9 +1709,29 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+             metalCmdEncoder.label = mLabel;
+         }
+ 
++        // Klepton: THE replay. Everything recorded since the pass began is issued to
++        // Metal here, on the CPU, at pass END. Suspected to be the ~9 ms that the game
++        // profiler attributes to the two framebuffer binds ("eyClr" 4.6 ms entirely on
++        // eye 1, "eyeend"/"readback" scaling with the draw count). Aggregated to one
++        // line per second -- per-pass logging would be ~5 lines/frame and perturb the
++        // very thing being measured.
++        const bool klTrace = RasterizationRateTraceEnabled();
++        const auto klT0 =
++            klTrace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++
++        // Klepton: tally the stream by command type while replaying it. Two open
++        // questions in one probe: WHERE the recorded draws come from (the probe counts
++        // ~2500 per frame against the game's 1410) and how many state binds ride along
++        // with each draw (~2.2 of the 3.2 us/cmd is binding, not drawing).
++        static size_t klCmdCount[256] = {};
++
+         while (mCommands.good())
+         {
+             CmdType cmdType = mCommands.fetch<CmdType>();
++            if (klTrace)
++            {
++                ++klCmdCount[static_cast<uint8_t>(cmdType)];
++            }
+             switch (cmdType)
+             {
+ #define ANGLE_MTL_CMD_MAP(CMD)                 \
+@@ -1695,6 +1743,73 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+             }
+         }
+ 
++        if (klTrace)
++        {
++            const auto klNow = std::chrono::steady_clock::now();
++            const double us  = std::chrono::duration<double, std::micro>(klNow - klT0).count();
++            const double nowSec =
++                std::chrono::duration<double>(klNow.time_since_epoch()).count();
++
++            static double sumUs = 0.0, worstUs = 0.0, windowStart = -1.0;
++            static size_t passes = 0, draws = 0, worstDraws = 0;
++            if (windowStart < 0.0)
++            {
++                windowStart = nowSec;
++            }
++            sumUs += us;
++            draws += mNumDraws;
++            ++passes;
++            if (us > worstUs)
++            {
++                worstUs    = us;
++                worstDraws = mNumDraws;
++            }
++
++            if (nowSec - windowStart >= 1.0)
++            {
++                // replay = CPU milliseconds spent replaying per SECOND. At ~85 fps a
++                // cost of 9 ms/frame would show as ~765 ms/s, i.e. most of a core.
++                fprintf(stderr,
++                        "[angle-vrr] encode/s passes=%zu draws=%zu replay=%.1fms/s "
++                        "avg=%.0fus/pass worst=%.2fms(%zu draws)\n",
++                        passes, draws, sumUs / 1000.0, passes ? sumUs / (double)passes : 0.0,
++                        worstUs / 1000.0, worstDraws);
++
++                // The stream breakdown, same window. Named so the draw kinds and the
++                // bind kinds can be read off directly instead of inferred.
++                static const char *kName[] = {
++#define ANGLE_MTL_CMD_NAME(CMD) #CMD,
++                    ANGLE_MTL_CMD_X(ANGLE_MTL_CMD_NAME)
++#undef ANGLE_MTL_CMD_NAME
++                };
++                const size_t nNames = sizeof(kName) / sizeof(kName[0]);
++                size_t total = 0, drawCmds = 0;
++                for (size_t i = 0; i < nNames; ++i)
++                {
++                    total += klCmdCount[i];
++                    if (strncmp(kName[i], "Draw", 4) == 0)
++                    {
++                        drawCmds += klCmdCount[i];
++                    }
++                }
++                fprintf(stderr, "[angle-vrr] cmds/s total=%zu draws=%zu perDraw=%.1f |",
++                        total, drawCmds, drawCmds ? (double)total / (double)drawCmds : 0.0);
++                for (size_t i = 0; i < nNames; ++i)
++                {
++                    if (klCmdCount[i])
++                    {
++                        fprintf(stderr, " %s=%zu", kName[i], klCmdCount[i]);
++                    }
++                }
++                fprintf(stderr, "\n");
++                memset(klCmdCount, 0, sizeof(klCmdCount));
++
++                sumUs = worstUs = 0.0;
++                passes = draws = worstDraws = 0;
++                windowStart                 = nowSec;
++            }
++        }
++
+         mCommands.clear();
+     }
+ }
+@@ -1724,6 +1839,8 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     mRenderPassDesc           = desc;
+     mRecording                = true;
+     mHasDrawCalls             = false;
++    mNumDraws                 = 0;
++    mHasRateMap               = (desc.rasterizationRateMap.get() != nil);
+     mRenderPassMaxScissorRect = {.x      = 0,
+                                  .y      = 0,
+                                  .width  = std::numeric_limits<NSUInteger>::max(),
+@@ -2088,7 +2205,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    // Klepton foveation: Metal allows only triangles under a rasterization rate map.
++    // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
++    // aborting; the world and coronas are triangles and draw normally.
++    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++        primitiveType != MTLPrimitiveTypeTriangleStrip)
++        return *this;
+     mHasDrawCalls = true;
++    ++mNumDraws;
+     mCommands.push(CmdType::Draw).push(primitiveType).push(vertexStart).push(vertexCount);
+ 
+     return *this;
+@@ -2102,7 +2226,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    // Klepton foveation: Metal allows only triangles under a rasterization rate map.
++    // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
++    // aborting; the world and coronas are triangles and draw normally.
++    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++        primitiveType != MTLPrimitiveTypeTriangleStrip)
++        return *this;
+     mHasDrawCalls = true;
++    ++mNumDraws;
+     mCommands.push(CmdType::DrawInstanced)
+         .push(primitiveType)
+         .push(vertexStart)
+@@ -2122,7 +2253,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    // Klepton foveation: Metal allows only triangles under a rasterization rate map.
++    // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
++    // aborting; the world and coronas are triangles and draw normally.
++    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++        primitiveType != MTLPrimitiveTypeTriangleStrip)
++        return *this;
+     mHasDrawCalls = true;
++    ++mNumDraws;
+     mCommands.push(CmdType::DrawInstancedBaseInstance)
+         .push(primitiveType)
+         .push(vertexStart)
+@@ -2142,12 +2280,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    // Klepton foveation: Metal allows only triangles under a rasterization rate map.
++    // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
++    // aborting; the world and coronas are triangles and draw normally.
++    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++        primitiveType != MTLPrimitiveTypeTriangleStrip)
++        return *this;
+     if (!indexBuffer)
+     {
+         return *this;
+     }
+ 
+     mHasDrawCalls = true;
++    ++mNumDraws;
+     cmdBuffer().setReadDependency(indexBuffer, /*isRenderCommand=*/true);
+ 
+     mCommands.push(CmdType::DrawIndexed)
+@@ -2170,12 +2315,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    // Klepton foveation: Metal allows only triangles under a rasterization rate map.
++    // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
++    // aborting; the world and coronas are triangles and draw normally.
++    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++        primitiveType != MTLPrimitiveTypeTriangleStrip)
++        return *this;
+     if (!indexBuffer)
+     {
+         return *this;
+     }
+ 
+     mHasDrawCalls = true;
++    ++mNumDraws;
+     cmdBuffer().setReadDependency(indexBuffer, /*isRenderCommand=*/true);
+ 
+     mCommands.push(CmdType::DrawIndexedInstanced)
+@@ -2202,12 +2354,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    // Klepton foveation: Metal allows only triangles under a rasterization rate map.
++    // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
++    // aborting; the world and coronas are triangles and draw normally.
++    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++        primitiveType != MTLPrimitiveTypeTriangleStrip)
++        return *this;
+     if (!indexBuffer)
+     {
+         return *this;
+     }
+ 
+     mHasDrawCalls = true;
++    ++mNumDraws;
+     cmdBuffer().setReadDependency(indexBuffer, /*isRenderCommand=*/true);
+ 
+     mCommands.push(CmdType::DrawIndexedInstancedBaseVertexBaseInstance)
+diff --git a/src/libANGLE/renderer/metal/mtl_common.mm b/src/libANGLE/renderer/metal/mtl_common.mm
+index c1658d0379..05932374f9 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.mm
++++ b/src/libANGLE/renderer/metal/mtl_common.mm
+@@ -141,7 +141,33 @@ bool AnyRasterizationRateMapsRegistered()
+ 
+ bool RasterizationRateTraceEnabled()
+ {
+-    static const bool enabled = getenv("KL_ANGLE_VRR_TRACE") != nullptr;
++    // Klepton: the banner exists because "no lines appeared" is ambiguous —
++    // it can mean the condition never fired OR that the freshly built ANGLE
++    // never reached the bundle. One line at first use separates those two,
++    // and names which probes this binary actually carries. Bump REV whenever
++    // probes are added or moved, so a stale framework is obvious from the log
++    // rather than from comparing timestamps by hand.
++    static const bool enabled = [] {
++        const bool on = getenv("KL_ANGLE_VRR_TRACE") != nullptr;
++        if (on)
++        {
++            const char *residentMB = getenv("KL_MTL_RESIDENT_MB");
++            const char *bufferGCMB = getenv("KL_MTL_BUFFER_GC_MB");
++            const char *gcDefer    = getenv("KL_MTL_GC_DEFER");
++            const char *deferCap   = getenv("KL_MTL_GC_DEFER_CAP_MB");
++            fprintf(stderr,
++                    "[angle-vrr] TRACE ACTIVE rev=10 probes="
++                    "encode/s,cmds/s,convertToMetalDesc,endEncoding,flushCB,flushIfNeeded,residentOver,"
++                    "bufferGC,bufferGCdefer,deferCap,prepareRenderPass,register "
++                    "KL_MTL_RESIDENT_MB=%s KL_MTL_BUFFER_GC_MB=%s KL_MTL_GC_DEFER=%s "
++                    "KL_MTL_GC_DEFER_CAP_MB=%s\n",
++                    residentMB ? residentMB : "(unset)",
++                    bufferGCMB ? bufferGCMB : "(unset)",
++                    gcDefer ? gcDefer : "(unset=on)",
++                    deferCap ? deferCap : "(unset=256)");
++        }
++        return on;
++    }();
+     return enabled;
+ }
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+index 39b8d357f3..e2ec4fe2f7 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+@@ -644,9 +644,30 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+     objCDesc.rasterizationRateMap = rasterizationRateMap;
+     if (RasterizationRateTraceEnabled())
+     {
+-        fprintf(stderr, "[angle-vrr] convertToMetalDesc map=%p -> objc %p (rtW=%u rtH=%u)\n",
+-                (void *)rasterizationRateMap, (void *)objCDesc.rasterizationRateMap, defaultWidth,
+-                defaultHeight);
++        // Klepton: tex0 identifies WHICH target a pass start belongs to. This
++        // function runs per pass START — and a rate map change forces an
++        // in-flight pass to be ended and restarted (see
++        // equalIgnoreLoadStoreOptions above), so a restart lands here again. A
++        // run of identical tex0 is therefore ONE pass broken and restarted,
++        // while differing tex0 means separate render targets. Those two have
++        // opposite causes and the map pointer alone cannot tell them apart.
++        //
++        // ms0 is logged beside it because with MSAA the pass rasterizes into the
++        // implicit multisample texture and resolves into tex0; tex0 is the stable
++        // identity, ms0 the one Metal actually writes.
++        const void *tex0 = nullptr;
++        const void *ms0  = nullptr;
++        if (numColorAttachments > 0)
++        {
++            const RenderPassColorAttachmentDesc &c0 = colorAttachments[0];
++            tex0 = c0.texture ? (const void *)c0.texture->get() : nullptr;
++            ms0  = c0.implicitMSTexture ? (const void *)c0.implicitMSTexture->get() : nullptr;
++        }
++        fprintf(stderr,
++                "[angle-vrr] convertToMetalDesc map=%p n=%u tex0=%p ms0=%p samples=%u (rtW=%u "
++                "rtH=%u)\n",
++                (void *)rasterizationRateMap, numColorAttachments, tex0, ms0, rasterSampleCount,
++                defaultWidth, defaultHeight);
+     }
+ 
+     if ((defaultWidth | defaultHeight) != 0)
