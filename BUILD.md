@@ -27,6 +27,7 @@ Reihenfolge ist Pflicht:
 ```bash
 git apply <kit>/patches/klepton.patch
 git apply <kit>/patches/angle-metal-fixes.patch
+git apply <kit>/patches/multiview-stage2.patch   # optional: Multiview-Arbeit
 ```
 
 ## 3. Bauen

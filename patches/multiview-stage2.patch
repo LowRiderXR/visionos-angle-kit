@@ -1,0 +1,59 @@
+multiview-stage2.patch — GL_OVR_multiview/2 im ANGLE-Metal-Backend melden
+==========================================================================
+(Stufe 2a des Multiview-Plans, Docs/vicecity/multiview-plan.md)
+
+Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Reihenfolge: nach klepton.patch UND angle-metal-fixes.patch anwenden.
+Stand:       Stufe 2a (2026-09-23) — Extension melden, NOCH OHNE WIRKUNG:
+             der Gast sieht GL_OVR_multiview/multiview2 und MAX_VIEWS_OVR=2,
+             Draws landen weiterhin einaeugig. Teil 2 (Multiview-Attachment
+             in FrameBufferMtl annehmen) folgt in diesem Patch, wenn er
+             steht.
+
+Aktivierung: NUR mit Umgebungsvariable KL_GL_MULTIVIEW=1 (Default: aus —
+             ohne die Variable aendert sich die Extension-Zeichenkette
+             nicht). Auf Geraet verifiziert 2026-09-23 (Gast sieht beide
+             Extensions aktiv, MAX_VIEWS_OVR=2, Spiel unauffaellig).
+
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index dbc9481363..10fcef1a3c 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -721,6 +721,14 @@ bool IsMetalDisplayAvailable()
+     initializeExtensions();
+     initializeTextureCaps();
+ 
++    // VC multiview, Stufe 2: the cap belonging to OVR_multiview above. Two is
++    // both the stereo need and the device's rate-map layer maximum (measured,
++    // see multiview-plan.md Stufe 0).
++    if (mNativeExtensions.multiviewOVR)
++    {
++        mNativeCaps.maxViews = 2;
++    }
++
+     // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
+     mNativeCaps.maxElementIndex  = std::numeric_limits<GLuint>::max() - 1;
+     mNativeCaps.max3DTextureSize = 2048;
+@@ -967,6 +975,22 @@ bool IsMetalDisplayAvailable()
+     // only source of YUV textures is the EGLImage sibling over a decoder frame.
+     mNativeExtensions.yuvInternalFormatANGLE        = true;
+ 
++    // VC multiview, Stufe 2 (Docs/vicecity/multiview-plan.md): advertise
++    // GL_OVR_multiview/2 to the guest WITHOUT any backend effect yet — draws
++    // still land single-eyed. Gated by KL_GL_MULTIVIEW=1 (default OFF) so the
++    // extension string only changes when the experiment explicitly asks for
++    // it; the frontend validation and entry points are generic and already
++    // compiled in. maxViews is set alongside in ensureCapsInitialized.
++    static const bool klMultiview = [] {
++        const char *e = getenv("KL_GL_MULTIVIEW");
++        return e && e[0] == '1';
++    }();
++    if (klMultiview)
++    {
++        mNativeExtensions.multiviewOVR  = true;
++        mNativeExtensions.multiview2OVR = true;
++    }
++
+     // EXT_debug_marker is not implemented yet, but the entry points must be exposed for the
+     // Metal backend to be used in Chrome (http://anglebug.com/42263519)
+     mNativeExtensions.debugMarkerEXT = true;
