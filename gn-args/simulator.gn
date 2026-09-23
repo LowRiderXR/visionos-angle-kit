@@ -5,3 +5,7 @@ target_environment = "simulator"
 ios_enable_code_signing = false
 angle_enable_vulkan = false
 angle_enable_swiftshader = false
+
+# Ab Xcode 27 (iOS-27.0-SDK) noetig — Begruendung in BUILD.md Abschnitt 7:
+angle_enable_perfetto = false
+use_lld = false

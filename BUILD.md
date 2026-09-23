@@ -3,9 +3,10 @@
 Ziel: `ANGLE_libEGL.xcframework` und `ANGLE_libGLESv2.xcframework` mit
 xros-Slices, Klepton-Foveation und unseren Metal-Fixes.
 
-Verifizierter Stand: gebaut mit Xcode 26.5 (Build `17F113`), läuft auf
-visionOS 26.6. ANGLE hat kein xros-Target — gebaut wird für iOS, dann
-retargetet (unten).
+Verifizierter Stand: gebaut mit Xcode 26.5 (Build `17F113`) UND mit
+Xcode 27.0 (Build `27A266a`, iOS-27.0-SDK — siehe Abschnitt 7 für die dabei
+nötigen Fixes); läuft auf visionOS 26.6. ANGLE hat kein xros-Target —
+gebaut wird für iOS, dann retargetet (unten).
 
 ## 1. Quellen holen
 
@@ -99,6 +100,38 @@ Wenn das eingebackene SDK nicht mehr existiert, aber nur einzelne
    Implizite (`|`) und order-only (`||`) Deps gehören **nicht** in `${in}`.
 3. Linken mit derselben Pfad-Ersetzung, dann Retarget wie in Abschnitt 4.
    Nur `libGLESv2` linkt das Metal-Backend — `libEGL` bleibt meist unberührt.
+
+## 7. Neubau bei Xcode-Wechsel — Protokoll Xcode 27 (2026-09-23)
+
+Beim ersten Bau von ANGLE@e4499e6b28 gegen das iOS-27.0-SDK traten genau
+drei Fehler auf; alle drei sind gn-Argumente, keine Quelländerungen (in
+`gn-args/*.gn` bereits enthalten):
+
+| Fehler | Ursache | Fix |
+|---|---|---|
+| `ld64.lld: could not load TAPI file … MacOSX27.0.sdk/….tbd: malformed file / unknown target` beim Host-Tool `protoc` (~Objekt 455) | ANGLEs gebündeltes altes lld kann die tbd-Stubs neuer SDKs nicht parsen; `protoc` kommt nur über die Perfetto-Abhängigkeit herein | `angle_enable_perfetto = false` (Tracing ist ohnehin aus) |
+| `error: function 'fprintf' is unsafe [-Werror,-Wunsafe-buffer-usage-in-libc-call]` in unseren Trace-Sonden (ContextMtl.mm u. a.) | Der unsafe-buffers-Clang-Plugin-Lint + `-Werror`; beim chirurgischen Bauen war `-Wno-error` angehängt, unter ninja nicht | **Datei-lokale Pragmas** (`#pragma clang diagnostic ignored "-Wunsafe-buffer-usage[-in-libc-call]"`) in den sechs Sonden-Dateien, Teil von `angle-metal-fixes.patch`. BEWUSST NICHT `treat_warnings_as_errors = false`: das wäre global und senkte die Warnschwelle im ganzen Baum; verifiziert 2026-09-23, dass der Baum mit `-Werror` und nur den Pragmas fehlerfrei baut |
+| `ld64.lld: could not load TAPI file … iPhoneOS27.0.sdk/….tbd` beim Link von libEGL/libGLESv2 (nach ~1272 Objekten) | dieselbe lld-Schwäche, jetzt am Ziel-Link — unumgehbar mit gebündeltem lld | `use_lld = false` (Apples Linker aus dem aktiven Xcode) |
+
+Vorgehen, das sich bewährt hat:
+
+1. **Neues out-Verzeichnis** (`out/ios27`), das alte nicht anfassen — der
+   alte ninja-Zustand ist die einzige Rückfallebene und gegen ein SDK
+   gebaut, das es nicht mehr gibt. Ebenso `Frameworks-pre27/` als Kopie der
+   zuletzt ausgelieferten xcframeworks anlegen, bevor installiert wird.
+2. `gn gen` mit den gn-args aus diesem Kit, Build, bei Fehlern die Tabelle
+   oben zuerst prüfen.
+3. Retarget/Bündeln wie in Abschnitt 4 (unter Xcode 27 unverändert gültig;
+   `-install_name @rpath/…` setzt der Build bereits, `install_name_tool`
+   entfällt).
+4. Verifikation: `nm`-Check (Abschnitt 5), rev-Banner, dann auf Gerät
+   Bildkorrektheit UND Performance gegen bekannte Werte — ein Build, der
+   läuft, aber langsamer ist, ist kein Erfolg.
+
+Zeitrahmen des protokollierten Laufs: gn gen + 2×~1300 Objekte + 3
+Fehlerrunden ≈ 45 Minuten. Auf Gerät abgenommen 2026-09-23: rev-Banner,
+Rate-Map-Spike 18/18 mit identischen Messwerten zum 26.5-Build, Bild
+korrekt, eye-GPU-Zeiten unverändert.
 
 ## Laufzeit-Schalter der Patches
 

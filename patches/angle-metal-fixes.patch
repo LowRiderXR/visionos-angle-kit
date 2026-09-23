@@ -4,10 +4,10 @@ angle-metal-fixes.patch — generische Fixes fürs ANGLE-Metal-Backend
 
 Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
 Reihenfolge: erst klepton.patch anwenden, dann diesen Patch (git apply).
-Erzeugt:     2026-09-21 aus dem Arbeitsbaum (Tag vc-local-state-20260921
+Erzeugt:     2026-09-23 aus dem Arbeitsbaum (Tag vc-local-state-20260923
              im angle-src-Checkout haelt den vollstaendigen Zustand).
 
-Inhalt (drei Gruppen):
+Inhalt (vier Gruppen):
 
 1. GC-Aufschub (Rain+Foveation-Flacker-Fix, PRODUKTIV):
    mtl_buffer_manager.{h,mm}, ContextMtl.{h,mm} —
@@ -27,6 +27,12 @@ Inhalt (drei Gruppen):
    ContextMtl.mm (endEncoding/flushCB-Trace mit dladdr),
    mtl_command_buffer.mm (encode/s-Replay-Timing, cmds/s-Kommandozaehlung,
    mNumDraws), mtl_buffer_manager.mm (bufferGC-Trace).
+
+4. Werror-Pragmas (ab Xcode-27-Toolchain noetig):
+   In allen sechs Sonden-Dateien ein datei-lokales
+   "#pragma clang diagnostic ignored -Wunsafe-buffer-usage[-in-libc-call]" —
+   Chromiums unsafe-buffers-Lint macht fprintf sonst zum Error. Bewusst
+   NICHT global (treat_warnings_as_errors bleibt an), siehe BUILD.md Ab. 7.
 
 Hinweis: Der implizite MSAA-Pfad (VC_MSAA_IMPLICIT) haengt von Gruppe 1+2 ab.
 Kleptons physicalPassthrough (Rate-Map-fester Blit) liegt in klepton.patch,
@@ -50,18 +56,26 @@ index 4ea4a3cc12..56dbd6ad0c 100644
      mtl::RenderCommandEncoder *getRenderCommandEncoder();
  
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
-index ad2cd4015c..2e76f7d452 100644
+index ad2cd4015c..82a75fb177 100644
 --- a/src/libANGLE/renderer/metal/ContextMtl.mm
 +++ b/src/libANGLE/renderer/metal/ContextMtl.mm
-@@ -11,6 +11,7 @@
+@@ -9,8 +9,15 @@
  
+ #include "libANGLE/renderer/metal/ContextMtl.h"
+ 
++// VC/Klepton diagnostics print via fprintf; Chromium's unsafe-buffers lint makes
++// libc calls an error under -Werror. Scoped to the probe-carrying files so the
++// global build keeps treat_warnings_as_errors (deliberate, see kit BUILD.md).
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
++
  #include <TargetConditionals.h>
  #include <cstdint>
 +#include <dlfcn.h>  // Klepton: dladdr() for the endEncoding caller trace
  
  #include "GLSLANG/ShaderLang.h"
  #include "common/debug.h"
-@@ -252,6 +253,12 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+@@ -252,6 +259,12 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
      // needed. This is typically required if two MTLDevices are
      // operating on the same IOSurface.
      flushCommandBuffer(mtl::NoWait);
@@ -74,7 +88,7 @@ index ad2cd4015c..2e76f7d452 100644
      return checkCommandBufferError();
  }
  angle::Result ContextMtl::finish(const gl::Context *context)
-@@ -1758,6 +1765,35 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+@@ -1758,6 +1771,35 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
  
      if (mRenderEncoder.valid())
      {
@@ -110,7 +124,7 @@ index ad2cd4015c..2e76f7d452 100644
          if (forceSaveRenderPassContent)
          {
              // Save the work in progress.
-@@ -1783,6 +1819,32 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+@@ -1783,6 +1825,32 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
  
  void ContextMtl::flushCommandBuffer(mtl::CommandBufferFinishOperation operation)
  {
@@ -143,7 +157,7 @@ index ad2cd4015c..2e76f7d452 100644
      mRenderPassesSinceFlush = 0;
      if (mCmdBuffer.ready())
      {
-@@ -1798,9 +1860,23 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+@@ -1798,9 +1866,23 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
  
  void ContextMtl::flushCommandBufferIfNeeded()
  {
@@ -170,7 +184,7 @@ index ad2cd4015c..2e76f7d452 100644
          // Ensure that we don't accumulate too many unflushed render passes. Don't wait until they
          // are submitted, other components handle backpressure so don't create uneccessary CPU/GPU
          // synchronization.
-@@ -1842,6 +1918,11 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+@@ -1842,6 +1924,11 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
             mRenderEncoder.renderPassDesc().equalIgnoreLoadStoreOptions(desc);
  }
  
@@ -182,6 +196,23 @@ index ad2cd4015c..2e76f7d452 100644
  bool ContextMtl::isCurrentRenderEncoderSerial(uint64_t serial)
  {
      if (!mRenderEncoder.valid())
+diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+index 49f308d386..f9d16a8e1a 100644
+--- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
++++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+@@ -8,6 +8,12 @@
+ //
+ 
+ #include "libANGLE/angletypes.h"
++
++// VC/Klepton diagnostics print via fprintf; Chromium's unsafe-buffers lint makes
++// libc calls an error under -Werror. Scoped to the probe-carrying files so the
++// global build keeps treat_warnings_as_errors (deliberate, see kit BUILD.md).
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
+ #include "libANGLE/renderer/metal/ContextMtl.h"
+ 
+ #include <TargetConditionals.h>
 diff --git a/src/libANGLE/renderer/metal/mtl_buffer_manager.h b/src/libANGLE/renderer/metal/mtl_buffer_manager.h
 index 1e68977c68..9b2689ef1b 100644
 --- a/src/libANGLE/renderer/metal/mtl_buffer_manager.h
@@ -225,11 +256,19 @@ index 1e68977c68..9b2689ef1b 100644
      BufferList mInUseBuffers;
  
 diff --git a/src/libANGLE/renderer/metal/mtl_buffer_manager.mm b/src/libANGLE/renderer/metal/mtl_buffer_manager.mm
-index ee57bbbf7d..bf30c11304 100644
+index ee57bbbf7d..ed5b7301c4 100644
 --- a/src/libANGLE/renderer/metal/mtl_buffer_manager.mm
 +++ b/src/libANGLE/renderer/metal/mtl_buffer_manager.mm
-@@ -10,6 +10,9 @@
+@@ -8,8 +8,17 @@
+ //
+ 
  #include "libANGLE/renderer/metal/mtl_buffer_manager.h"
++
++// VC/Klepton diagnostics print via fprintf; Chromium's unsafe-buffers lint makes
++// libc calls an error under -Werror. Scoped to the probe-carrying files so the
++// global build keeps treat_warnings_as_errors (deliberate, see kit BUILD.md).
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
  #include "common/unsafe_buffers.h"
  
 +#include <algorithm>  // Klepton: std::max für die Defer-Spitzenwerte
@@ -238,7 +277,7 @@ index ee57bbbf7d..bf30c11304 100644
  #include "libANGLE/renderer/metal/ContextMtl.h"
  #include "libANGLE/renderer/metal/DisplayMtl.h"
  
-@@ -187,11 +190,68 @@ int storageModeToCacheIndex(MTLStorageMode storageMode)
+@@ -187,11 +196,68 @@ int storageModeToCacheIndex(MTLStorageMode storageMode)
      }
  }
  
@@ -307,7 +346,7 @@ index ee57bbbf7d..bf30c11304 100644
      freeUnusedBuffers(contextMtl);
      const int cacheIndex = storageModeToCacheIndex(storageMode);
      if (cacheIndex < kNumCachedStorageModes)
-@@ -230,25 +290,104 @@ int storageModeToCacheIndex(MTLStorageMode storageMode)
+@@ -230,25 +296,104 @@ int storageModeToCacheIndex(MTLStorageMode storageMode)
      }
  #endif
  
@@ -457,12 +496,19 @@ index 2221ba033f..e54dca6abe 100644
  
      gl::ShaderMap<uint8_t> mSetBufferCmds;
 diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
-index 1dd725df17..04a1be440d 100644
+index 1dd725df17..32481a7599 100644
 --- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
 +++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
-@@ -11,7 +11,9 @@
+@@ -10,8 +10,16 @@
+ 
  #include "libANGLE/renderer/metal/mtl_command_buffer.h"
  
++// VC/Klepton diagnostics print via fprintf; Chromium's unsafe-buffers lint makes
++// libc calls an error under -Werror. Scoped to the probe-carrying files so the
++// global build keeps treat_warnings_as_errors (deliberate, see kit BUILD.md).
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
++
  #include <cassert>
 +#include <chrono>  // Klepton: timing the command replay in encodeMetalEncoder
  #include <cstdint>
@@ -470,7 +516,7 @@ index 1dd725df17..04a1be440d 100644
  #include <random>
  #include <type_traits>
  #include "mtl_command_buffer.h"
-@@ -963,7 +965,33 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -963,7 +971,33 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
  
  bool CommandBuffer::needsFlushForDrawCallLimits() const
  {
@@ -505,7 +551,7 @@ index 1dd725df17..04a1be440d 100644
  }
  
  uint64_t CommandBuffer::getQueueSerial() const
-@@ -1681,9 +1709,29 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -1681,9 +1715,29 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
              metalCmdEncoder.label = mLabel;
          }
  
@@ -535,7 +581,7 @@ index 1dd725df17..04a1be440d 100644
              switch (cmdType)
              {
  #define ANGLE_MTL_CMD_MAP(CMD)                 \
-@@ -1695,6 +1743,73 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -1695,6 +1749,73 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
              }
          }
  
@@ -609,7 +655,7 @@ index 1dd725df17..04a1be440d 100644
          mCommands.clear();
      }
  }
-@@ -1724,6 +1839,8 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -1724,6 +1845,8 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      mRenderPassDesc           = desc;
      mRecording                = true;
      mHasDrawCalls             = false;
@@ -618,7 +664,7 @@ index 1dd725df17..04a1be440d 100644
      mRenderPassMaxScissorRect = {.x      = 0,
                                   .y      = 0,
                                   .width  = std::numeric_limits<NSUInteger>::max(),
-@@ -2088,7 +2205,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -2088,7 +2211,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      ASSERT(mPipelineStateSet &&
             "Render Pipeline State was never set and we've issued a draw command.");
      CheckPrimitiveType(primitiveType);
@@ -633,7 +679,7 @@ index 1dd725df17..04a1be440d 100644
      mCommands.push(CmdType::Draw).push(primitiveType).push(vertexStart).push(vertexCount);
  
      return *this;
-@@ -2102,7 +2226,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -2102,7 +2232,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      ASSERT(mPipelineStateSet &&
             "Render Pipeline State was never set and we've issued a draw command.");
      CheckPrimitiveType(primitiveType);
@@ -648,7 +694,7 @@ index 1dd725df17..04a1be440d 100644
      mCommands.push(CmdType::DrawInstanced)
          .push(primitiveType)
          .push(vertexStart)
-@@ -2122,7 +2253,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -2122,7 +2259,14 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      ASSERT(mPipelineStateSet &&
             "Render Pipeline State was never set and we've issued a draw command.");
      CheckPrimitiveType(primitiveType);
@@ -663,7 +709,7 @@ index 1dd725df17..04a1be440d 100644
      mCommands.push(CmdType::DrawInstancedBaseInstance)
          .push(primitiveType)
          .push(vertexStart)
-@@ -2142,12 +2280,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -2142,12 +2286,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      ASSERT(mPipelineStateSet &&
             "Render Pipeline State was never set and we've issued a draw command.");
      CheckPrimitiveType(primitiveType);
@@ -683,7 +729,7 @@ index 1dd725df17..04a1be440d 100644
      cmdBuffer().setReadDependency(indexBuffer, /*isRenderCommand=*/true);
  
      mCommands.push(CmdType::DrawIndexed)
-@@ -2170,12 +2315,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -2170,12 +2321,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      ASSERT(mPipelineStateSet &&
             "Render Pipeline State was never set and we've issued a draw command.");
      CheckPrimitiveType(primitiveType);
@@ -703,7 +749,7 @@ index 1dd725df17..04a1be440d 100644
      cmdBuffer().setReadDependency(indexBuffer, /*isRenderCommand=*/true);
  
      mCommands.push(CmdType::DrawIndexedInstanced)
-@@ -2202,12 +2354,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+@@ -2202,12 +2360,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
      ASSERT(mPipelineStateSet &&
             "Render Pipeline State was never set and we've issued a draw command.");
      CheckPrimitiveType(primitiveType);
@@ -724,10 +770,23 @@ index 1dd725df17..04a1be440d 100644
  
      mCommands.push(CmdType::DrawIndexedInstancedBaseVertexBaseInstance)
 diff --git a/src/libANGLE/renderer/metal/mtl_common.mm b/src/libANGLE/renderer/metal/mtl_common.mm
-index c1658d0379..05932374f9 100644
+index c1658d0379..89b099b5ae 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.mm
 +++ b/src/libANGLE/renderer/metal/mtl_common.mm
-@@ -141,7 +141,33 @@ bool AnyRasterizationRateMapsRegistered()
+@@ -9,6 +9,12 @@
+ 
+ #include "libANGLE/renderer/metal/mtl_common.h"
+ 
++// VC/Klepton diagnostics print via fprintf; Chromium's unsafe-buffers lint makes
++// libc calls an error under -Werror. Scoped to the probe-carrying files so the
++// global build keeps treat_warnings_as_errors (deliberate, see kit BUILD.md).
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
++
+ #include <dispatch/dispatch.h>
+ 
+ #include <atomic>
+@@ -141,7 +147,33 @@ bool AnyRasterizationRateMapsRegistered()
  
  bool RasterizationRateTraceEnabled()
  {
@@ -763,10 +822,23 @@ index c1658d0379..05932374f9 100644
  }
  
 diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
-index 39b8d357f3..e2ec4fe2f7 100644
+index 39b8d357f3..86b85f3183 100644
 --- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
 +++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
-@@ -644,9 +644,30 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+@@ -10,6 +10,12 @@
+ 
+ #include "libANGLE/renderer/metal/mtl_state_cache.h"
+ 
++// VC/Klepton diagnostics print via fprintf; Chromium's unsafe-buffers lint makes
++// libc calls an error under -Werror. Scoped to the probe-carrying files so the
++// global build keeps treat_warnings_as_errors (deliberate, see kit BUILD.md).
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
++
+ #include <sstream>
+ 
+ #include "common/debug.h"
+@@ -644,9 +650,30 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
      objCDesc.rasterizationRateMap = rasterizationRateMap;
      if (RasterizationRateTraceEnabled())
      {
