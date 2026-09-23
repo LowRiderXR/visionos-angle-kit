@@ -1,0 +1,122 @@
+multiview-stage3.patch — gl_ViewID_OVR/gl_Layer im MSL-Uebersetzer
+===================================================================
+(Stufe 3 des Multiview-Plans, Docs/vicecity/multiview-plan.md;
+Beleg: Docs/vicecity/multiview-stufe3-msl-beleg.md)
+
+Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Reihenfolge: nach klepton.patch, angle-metal-fixes.patch und
+             multiview-stage2.patch anwenden.
+Stand:       Stufe 3 (2026-09-23), am Schreibtisch verifiziert:
+             Minimal- UND echter librw-Skin-Shader (mit VC-Injektionen)
+             uebersetzen zur Instanz-Emulation, und das erzeugte MSL
+             kompiliert mit xcrun metal fehlerfrei. Laufzeitwirkung erst
+             mit Stufe 4 (Draw-Verdrahtung: Instanzzahl verdoppeln,
+             ANGLE_multiviewBaseViewLayerIndex fuellen).
+
+Drei Fixes derselben Klasse — Multiview-Symbole entkamen der
+MSL-Pipeline-Sammlung:
+
+1. TranslatorMSL.cpp: gl_Layer (von der Instanced-Multiview-Emulation
+   geschrieben) wird als Builtin deklariert, sobald es im Baum vorkommt —
+   vorher referenzierte der Emitter ein nie deklariertes Symbol.
+2. Pipeline.cpp: EvqLayerOut wandert ins VertexOut-Struct;
+   EvqEmulatedViewIDOVR (ViewID_OVR) in die NonConstGlobals — sonst
+   mutable Programm-Globale, die Metal ablehnt.
+3. EmitMetal.cpp: gl_Layer bekommt [[render_target_array_index]] und wird
+   als uint32_t deklariert (Metal verlangt unsigned; die int-Zuweisung
+   der Emulation konvertiert implizit).
+
+Geraete-Vorbedingung (Gate, 2026-09-23, PASS 18/18): Rate Map + Layer-
+Routing per render_target_array_index pro Instanz + memoryless MSAA
+funktionieren zusammen (VC_MV_SPIKE=3, MultiviewSpike.swift).
+
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 014df1fe73..0ed7d55cf6 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -836,6 +836,14 @@ void GenMetalTraverser::emitPostQualifier(const EmitVariableDeclarationConfig &e
+             mOut << " [[point_size]]";
+             break;
+ 
++        case TQualifier::EvqLayerOut:
++            // VC multiview (Stufe 3): route the instanced-multiview emulation's
++            // gl_Layer into the target slice. Metal requires an unsigned type
++            // for this attribute; the declaration type is overridden to
++            // uint32_t in emitVariableDeclaration.
++            mOut << " [[render_target_array_index]]";
++            break;
++
+         case TQualifier::EvqVertexID:
+             if (evdConfig.isMainParameter)
+             {
+@@ -1568,7 +1576,19 @@ void GenMetalTraverser::emitVariableDeclaration(const VarDecl &decl,
+         default:
+         {
+             ASSERT(symbolType != SymbolType::Empty || evdConfig.isParameter);
+-            emitOrdinaryVariableDeclaration(decl, evdConfig);
++            // VC multiview (Stufe 3): gl_Layer is int in GLSL, but Metal's
++            // [[render_target_array_index]] attribute requires an unsigned
++            // type. Emit the DECLARATION as uint32_t; the int expression the
++            // multiview emulation assigns converts implicitly (C++ rules).
++            if (type.getQualifier() == TQualifier::EvqLayerOut)
++            {
++                mOut << "uint32_t ";
++                emitNameOf(decl);
++            }
++            else
++            {
++                emitOrdinaryVariableDeclaration(decl, evdConfig);
++            }
+         }
+     }
+ 
+diff --git a/src/compiler/translator/msl/Pipeline.cpp b/src/compiler/translator/msl/Pipeline.cpp
+index 4fa250ae0a..74ca53b634 100644
+--- a/src/compiler/translator/msl/Pipeline.cpp
++++ b/src/compiler/translator/msl/Pipeline.cpp
+@@ -47,6 +47,11 @@ bool Pipeline::uses(const TVariable &var) const
+                 case TQualifier::EvqVertexOut:
+                 case TQualifier::EvqPosition:
+                 case TQualifier::EvqPointSize:
++                // VC multiview (Stufe 3): gl_Layer, written by the instanced-
++                // multiview emulation, must travel in the vertex output struct
++                // as [[render_target_array_index]] — without this the emitter
++                // references gl_Layer without ever declaring it.
++                case TQualifier::EvqLayerOut:
+                 case TQualifier::EvqClipDistance:
+                 case TQualifier::EvqSmoothOut:
+                 case TQualifier::EvqFlatOut:
+@@ -108,6 +113,12 @@ bool Pipeline::uses(const TVariable &var) const
+             {
+                 case TQualifier::EvqGlobal:
+                 case TQualifier::EvqSamplePosition:
++                // VC multiview (Stufe 3): the instanced-multiview emulation's
++                // ViewID_OVR global carries this qualifier (its InstanceID
++                // sibling is plain EvqGlobal and was collected all along);
++                // without it, ViewID_OVR is emitted as a mutable program-scope
++                // global, which Metal rejects.
++                case TQualifier::EvqEmulatedViewIDOVR:
+                     return true;
+                 case TQualifier::EvqSampleMaskIn:
+                 case TQualifier::EvqSampleMask:
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 280422147d..69be6c17d6 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -1030,6 +1030,16 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         {
+             AddBuiltInDeclaration(*root, symbolTable, *BuiltInVariable::gl_VertexID());
+         }
++        // VC multiview (Stufe 3): the instanced-multiview emulation writes
++        // gl_Layer, but nothing declares it for the MSL pipeline rewriter, so
++        // the emitter referenced an undeclared symbol. Declare it like the
++        // other builtins; Pipeline.cpp routes EvqLayerOut into the VertexOut
++        // struct and EmitMetal.cpp attaches [[render_target_array_index]].
++        if (getShaderType() == GL_VERTEX_SHADER &&
++            FindSymbolNode(root, ImmutableString("gl_Layer")) != nullptr)
++        {
++            AddBuiltInDeclaration(*root, symbolTable, *BuiltInVariable::gl_LayerVS());
++        }
+     }
+     SymbolEnv symbolEnv(*this, *root);
+ 
