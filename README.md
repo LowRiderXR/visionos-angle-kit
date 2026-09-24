@@ -13,6 +13,7 @@ Das Verfahren steht in [BUILD.md](BUILD.md).
 | `patches/angle-metal-fixes.patch` | GC-Aufschub (Flacker-Fix unter Rate Map), Nicht-Dreieck-Skip, Diagnose-Sonden, Werror-Pragmas | eigener Code, Details im Patch-Kopf |
 | `patches/multiview-stage2.patch` | GL_OVR_multiview/2 melden (Stufe 2, ohne Wirkung; nur mit `KL_GL_MULTIVIEW=1`) | eigener Code |
 | `patches/multiview-stage3.patch` | gl_ViewID_OVR/gl_Layer im MSL-Übersetzer (Instanz-Emulation vollständig; Laufzeitwirkung erst mit Stufe 4) | eigener Code, Details im Patch-Kopf |
+| `patches/multiview-stage4.patch` | Draw-Verdrahtung: Instanzen ×numViews, layered Pass, Layer-Basis-Uniform (4a; 4b folgt) | eigener Code, Details im Patch-Kopf |
 | `gn-args/device.gn` | gn-Argumente für den Gerätebau (iOS-Route, dann Retarget) | — |
 | `gn-args/simulator.gn` | gn-Argumente für den Simulatorbau | — |
 
@@ -21,8 +22,9 @@ Das Verfahren steht in [BUILD.md](BUILD.md).
 - ANGLE-Basis: `e4499e6b2835a6996507f1b99920bc56f0122573`
   (https://chromium.googlesource.com/angle/angle.git)
 - Patch-Reihenfolge: `klepton.patch` → `angle-metal-fixes.patch` →
-  `multiview-stage2.patch` → `multiview-stage3.patch` (die letzten beiden
-  optional; nur für Multiview-Arbeit).
+  `multiview-stage2.patch` → `multiview-stage3.patch` →
+  `multiview-stage4.patch` (die multiview-Patches optional, in dieser
+  Reihenfolge; nur für Multiview-Arbeit).
 - Verwendet von: AvpViceCity (Xcode-Projekt referenziert
   `Prototypes/angle-src/Frameworks/`; `Prototypes/angle-patches/` ist ein
   Symlink auf `patches/` hier).

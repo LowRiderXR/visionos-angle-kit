@@ -1,0 +1,411 @@
+multiview-stage4.patch — Draw-Verdrahtung der Multiview-Emulation
+==================================================================
+(Stufe 4 des Multiview-Plans, Docs/vicecity/multiview-plan.md)
+
+Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Reihenfolge: nach klepton.patch, angle-metal-fixes.patch,
+             multiview-stage2.patch und multiview-stage3.patch anwenden.
+Stand:       Stufe 4a KOMPLETT (2026-09-24), Ende-zu-Ende verifiziert am
+             HOST (macOS-Metal) UND auf GERAET (Vision Pro M5): voller
+             Draw+Readback-Test, plain und foveiert je 16/16 PASS,
+             subpixelgenau gegen die Map-Selbstauskunft, Werte auf beiden
+             Plattformen deckungsgleich. 4b (OVR_multiview_multisampled_
+             render_to_texture am impliziten MSAA-Pfad) folgt.
+
+Bausteine (Muster: GL-Backend):
+
+1. ContextMtl: Draws in Multiview-FBOs laufen instanced x numViews
+   (AdjustInstancesForMultiview in beiden Draw-Trichteln); Pipeline bekommt
+   inputPrimitiveTopology=Triangle (Metal verwirft render_target_array_index
+   sonst STILL, alles landet in Slice 0 — Host-Repro-Befund; bekannte
+   Limitation: Linien/Punkte in Multiview-FBOs braeuchten den echten Mode);
+   handleDirtyDriverUniforms fuellt multiviewBaseViewIndex.
+2. FrameBufferMtl::prepareRenderPass: Multiview-FBO => layered Pass
+   (renderTargetArrayLength, Attachments ab Slice 0).
+3. mtl_state_cache: renderTargetArrayLength in RenderPassDesc
+   (Vergleich + Metal-Konvertierung), Default 0 = unveraendert.
+4. ShaderMtl: setzt initializeBuiltinsForInstancedMultiview UND
+   selectViewInNvGLSLVertexShader, wenn die Extension aktiv ist — ohne
+   Ersteres laeuft die Emulation gar nicht (nacktes gl_ViewID_OVR im MSL),
+   ohne Zweiteres fehlt die gl_Layer-Zuweisung.
+5. Transform-ASSERT um MSL-Ausgabe erweitert (selectView war GLSL/ESSL-only).
+6. TranslatorMSL: (a) Multiview-Vertex-Shader bekommen KEIN [[point_size]]
+   (Metal verbietet point_size + spezifizierte Topologieklasse; Layered
+   Rendering braucht die Klasse — GL_POINTS in Multiview-FBOs geopfert);
+   (b) das interne multiviewBaseViewLayerIndex-USER-Uniform wird entfernt
+   und auf ein Driver-Uniform-Feld umgeschrieben — als User-Uniform
+   verschob es das MSL-Block-Layout gegen die Frontend-Layout-Map und alle
+   echten User-Uniforms kamen als Null an (Host-Repro-Befund).
+7. DriverUniformMetal: Spare-uvec2 gesplittet in multiviewBaseViewIndex(int)
+   + unused(uint), Getter; Laufzeit-Struct in ContextMtl.h synchron.
+
+Verifikation am Host: out/host-Build (target_os=mac) + /tmp/mv4host-Repro —
+LINK+Draw+Readback mit Balkenmuster, Soll aus mapScreenToPhysicalCoordinates.
+Vier echte Defekte wurden ausschliesslich ueber diese Schreibtisch-Schleife
+gefunden (Compile-Option, selectView-Gate, point_size-Kollision,
+User-Uniform-Layout); ein Geraetelauf haette pro Defekt einen Zyklus
+gekostet.
+
+diff --git a/src/compiler/translator/msl/DriverUniformMetal.cpp b/src/compiler/translator/msl/DriverUniformMetal.cpp
+index 10d08743f9..b7950f5985 100644
+--- a/src/compiler/translator/msl/DriverUniformMetal.cpp
++++ b/src/compiler/translator/msl/DriverUniformMetal.cpp
+@@ -22,6 +22,9 @@ namespace
+ constexpr const char kXfbBufferOffsets[]       = "xfbBufferOffsets";
+ constexpr const char kXfbVerticesPerInstance[] = "xfbVerticesPerInstance";
+ constexpr const char kCoverageMask[]           = "coverageMask";
++// VC multiview (Stufe 4a): first spare slot repurposed for the base view
++// index; layout stays identical (int + uint == the former uvec2).
++constexpr const char kMultiviewBaseViewIndex[] = "multiviewBaseViewIndex";
+ constexpr const char kUnused[]                 = "unused";
+ 
+ }  // namespace
+@@ -32,10 +35,10 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
+ {
+     TFieldList *driverFieldList = DriverUniform::createUniformFields(symbolTable);
+ 
+-    constexpr size_t kNumGraphicsDriverUniformsMetal = 4;
++    constexpr size_t kNumGraphicsDriverUniformsMetal = 5;
+     constexpr std::array<const char *, kNumGraphicsDriverUniformsMetal>
+-        kGraphicsDriverUniformNamesMetal = {
+-            {kXfbBufferOffsets, kXfbVerticesPerInstance, kCoverageMask, kUnused}};
++        kGraphicsDriverUniformNamesMetal = {{kXfbBufferOffsets, kXfbVerticesPerInstance,
++                                             kCoverageMask, kMultiviewBaseViewIndex, kUnused}};
+ 
+     const std::array<TType *, kNumGraphicsDriverUniformsMetal> kDriverUniformTypesMetal = {{
+         // xfbBufferOffsets: uvec4
+@@ -44,8 +47,10 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
+         new TType(EbtInt, EbpHigh, EvqGlobal),
+         // coverageMask: uint
+         new TType(EbtUInt, EbpHigh, EvqGlobal),
+-        // unused: uvec2
+-        new TType(EbtUInt, EbpHigh, EvqGlobal, 2),
++        // multiviewBaseViewIndex: int (VC multiview, Stufe 4a)
++        new TType(EbtInt, EbpHigh, EvqGlobal),
++        // unused: uint (remainder of the former uvec2 spare)
++        new TType(EbtUInt, EbpHigh, EvqGlobal),
+     }};
+ 
+     for (size_t uniformIndex = 0; uniformIndex < kNumGraphicsDriverUniformsMetal; ++uniformIndex)
+@@ -65,4 +70,9 @@ TIntermTyped *DriverUniformMetal::getCoverageMaskField() const
+     return createDriverUniformRef(kCoverageMask);
+ }
+ 
++TIntermTyped *DriverUniformMetal::getMultiviewBaseViewIndexField() const
++{
++    return createDriverUniformRef(kMultiviewBaseViewIndex);
++}
++
+ }  // namespace sh
+diff --git a/src/compiler/translator/msl/DriverUniformMetal.h b/src/compiler/translator/msl/DriverUniformMetal.h
+index b49448d3f2..9a4db525d6 100644
+--- a/src/compiler/translator/msl/DriverUniformMetal.h
++++ b/src/compiler/translator/msl/DriverUniformMetal.h
+@@ -23,6 +23,9 @@ class DriverUniformMetal : public DriverUniformExtended
+     ~DriverUniformMetal() override {}
+ 
+     TIntermTyped *getCoverageMaskField() const;
++    // VC multiview (Stufe 4a): base view index for the instanced-multiview
++    // emulation, carried in the driver uniform block (repurposed spare).
++    TIntermTyped *getMultiviewBaseViewIndexField() const;
+ 
+   protected:
+     TFieldList *createUniformFields(TSymbolTable *symbolTable) override;
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 69be6c17d6..53298642ed 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -975,6 +975,45 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         driverUniforms->addGraphicsDriverUniformsToShader(root, &getSymbolTable());
+     }
+ 
++    // VC multiview (Stufe 4a): the shared instanced-multiview transform reads
++    // the base view index from an internal USER uniform — but the MSL default
++    // uniform block layout is computed from the collected uniforms, which do
++    // not include internal ones, so that uniform silently shifts every real
++    // user uniform (found via the host draw repro: u_screen arrived as zero).
++    // Carry the value in the driver uniform block instead: drop the internal
++    // uniform's declaration (or the pipeline rewriter would re-add it to the
++    // user struct) and rewrite its references to the repurposed driver field.
++    if (getShaderType() == GL_VERTEX_SHADER)
++    {
++        const TIntermSymbol *mvBaseSymbol =
++            FindSymbolNode(root, ImmutableString("multiviewBaseViewLayerIndex"));
++        if (mvBaseSymbol != nullptr)
++        {
++            const TVariable *mvBaseVar = &mvBaseSymbol->variable();
++            TIntermSequence *topLevel  = root->getSequence();
++            for (size_t i = 0; i < topLevel->size(); ++i)
++            {
++                TIntermDeclaration *declNode = (*topLevel)[i]->getAsDeclarationNode();
++                if (declNode == nullptr || declNode->getSequence()->empty())
++                {
++                    continue;
++                }
++                TIntermSymbol *declSymbol =
++                    declNode->getSequence()->front()->getAsSymbolNode();
++                if (declSymbol != nullptr && &declSymbol->variable() == mvBaseVar)
++                {
++                    topLevel->erase(topLevel->begin() + i);
++                    break;
++                }
++            }
++            if (!ReplaceVariableWithTyped(this, root, mvBaseVar,
++                                          driverUniforms->getMultiviewBaseViewIndexField()))
++            {
++                return false;
++            }
++        }
++    }
++
+     if (atomicCounterCount > 0)
+     {
+         const TIntermTyped *acbBufferOffsets = driverUniforms->getAcbBufferOffsets();
+@@ -1261,6 +1300,16 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         DeclareRightBeforeMain(*root, *BuiltInVariable::gl_Position());
+         // Always declare gl_PointSize to get [[point_size]] defined in case
+         // client draws with GL_POINTS.
++        //
++        // VC multiview (Stufe 4a): EXCEPT for multiview vertex shaders. Metal
++        // rejects a pipeline whose vertex shader writes [[point_size]] while
++        // inputPrimitiveTopology is a specified class ("Vertex shader writes
++        // point size but inputPrimitiveTopology is ...Triangle"), and layered
++        // rendering via [[render_target_array_index]] REQUIRES a specified
++        // class. GL_POINTS into a multiview framebuffer is forfeited; nothing
++        // in this port draws it. (gl_Layer is present exactly when the
++        // instanced-multiview transform ran.)
++        if (FindSymbolNode(root, ImmutableString("gl_Layer")) == nullptr)
+         {
+ 
+             const TVariable *pointSize = getShaderVersion() >= 300
+diff --git a/src/compiler/translator/tree_ops/DeclareAndInitBuiltinsForInstancedMultiview.cpp b/src/compiler/translator/tree_ops/DeclareAndInitBuiltinsForInstancedMultiview.cpp
+index 22ee62642b..b2ff6df70d 100644
+--- a/src/compiler/translator/tree_ops/DeclareAndInitBuiltinsForInstancedMultiview.cpp
++++ b/src/compiler/translator/tree_ops/DeclareAndInitBuiltinsForInstancedMultiview.cpp
+@@ -141,8 +141,10 @@ bool DeclareAndInitBuiltinsForInstancedMultiview(TCompiler *compiler,
+         // be done only for the GLSL and ESSL output.
+         const bool selectView = compileOptions.selectViewInNvGLSLVertexShader;
+         // Assert that if the view is selected in the vertex shader, then the output is
+-        // either GLSL or ESSL.
+-        ASSERT(!selectView || IsOutputGLSL(shaderOutput) || IsOutputESSL(shaderOutput));
++        // GLSL, ESSL or (VC multiview, Stufe 3/4) MSL, whose emitter routes
++        // gl_Layer as [[render_target_array_index]].
++        ASSERT(!selectView || IsOutputGLSL(shaderOutput) || IsOutputESSL(shaderOutput) ||
++               shaderOutput == SH_MSL_METAL_OUTPUT);
+         if (selectView)
+         {
+             // Add a uniform to pass the base view index.
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 56dbd6ad0c..1663d18294 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -573,7 +573,10 @@ class ContextMtl : public ContextImpl, public mtl::Context
+         int32_t xfbBufferOffsets[4];
+         int32_t xfbVerticesPerInstance;
+         uint32_t coverageMask;  // Metal specific
+-        uint32_t unused2[2];
++        // VC multiview (Stufe 4a): base view index of the draw framebuffer
++        // (repurposed spare; the remaining uint keeps the 16-byte alignment).
++        int32_t multiviewBaseViewIndex;
++        uint32_t unused2;
+     };
+     static_assert(sizeof(DriverUniforms) % (sizeof(uint32_t) * 4) == 0,
+                   "DriverUniforms should be 16 bytes aligned");
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 82a75fb177..a8d3bc930a 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -439,6 +439,26 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     return angle::Result::Continue;
+ }
+ 
++// VC multiview (Stufe 4a): mirror of ContextGL's GetInstancedDrawAdjustedInstanceCount.
++// The instanced-multiview emulation runs numViews instances per source instance and
++// derives ViewID = instance % numViews in the shader, so every draw into a multiview
++// framebuffer becomes an instanced draw with the count multiplied. Zero stays the
++// "not instanced" sentinel only when multiview is off.
++static GLsizei AdjustInstancesForMultiview(const gl::State &glState, GLsizei instances)
++{
++    const gl::ProgramExecutable *executable = glState.getProgramExecutable();
++    if (!executable || !executable->usesMultiview())
++    {
++        return instances;
++    }
++    const gl::Framebuffer *drawFramebuffer = glState.getDrawFramebuffer();
++    if (!drawFramebuffer || !drawFramebuffer->getState().isMultiview())
++    {
++        return instances;
++    }
++    return (instances != 0 ? instances : 1) * executable->getNumViews();
++}
++
+ angle::Result ContextMtl::drawArraysImpl(const gl::Context *context,
+                                          gl::PrimitiveMode mode,
+                                          GLint first,
+@@ -446,6 +466,9 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                          GLsizei instances,
+                                          GLuint baseInstance)
+ {
++    // VC multiview (Stufe 4a): a multiview draw always runs instanced.
++    instances = AdjustInstancesForMultiview(mState, instances);
++
+     // Real instances count. Zero means this is not instanced draw.
+     GLsizei instanceCount = instances ? instances : 1;
+ 
+@@ -769,6 +792,9 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                            GLint baseVertex,
+                                            GLuint baseInstance)
+ {
++    // VC multiview (Stufe 4a): a multiview draw always runs instanced.
++    instances = AdjustInstancesForMultiview(mState, instances);
++
+     // Real instances count. Zero means this is not instanced draw.
+     GLsizei instanceCount = instances ? instances : 1;
+ 
+@@ -2820,6 +2846,12 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+     mDriverUniforms.renderArea = mDrawFramebuffer->getState().getDimensions().height << 16 |
+                                  mDrawFramebuffer->getState().getDimensions().width;
+ 
++    // VC multiview (Stufe 4a): base view for the instanced-multiview
++    // emulation's gl_Layer. Zero for every non-multiview framebuffer.
++    mDriverUniforms.multiviewBaseViewIndex =
++        mDrawFramebuffer->getState().isMultiview() ? mDrawFramebuffer->getState().getBaseViewIndex()
++                                                   : 0;
++
+     const float flipX      = 1.0;
+     const float flipY      = mDrawFramebuffer->getFlipY() ? -1.0f : 1.0f;
+     mDriverUniforms.flipXY = gl::PackSnorm4x8(
+@@ -2979,7 +3011,22 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+         {
+             mRenderPipelineDesc.setRasterizationType(mtl::RenderPipelineRasterization::Enabled);
+         }
+-        mRenderPipelineDesc.setInputPrimitiveTopology(MTLPrimitiveTopologyClassUnspecified);
++        // VC multiview (Stufe 4a): layered rendering — a vertex shader writing
++        // [[render_target_array_index]] — requires a SPECIFIED topology class
++        // on the pipeline; with Unspecified, Metal silently drops the layer
++        // index and every view lands in slice 0 (found via the host-build draw
++        // repro, 2026-09-24). The draw mode is not known here; Triangle covers
++        // this port's multiview passes (under a rate map Metal allows only
++        // triangles anyway). Known limitation: line/point draws into a
++        // multiview FBO would need the actual mode plumbed through.
++        if (mDrawFramebuffer && mDrawFramebuffer->getState().isMultiview())
++        {
++            mRenderPipelineDesc.setInputPrimitiveTopology(MTLPrimitiveTopologyClassTriangle);
++        }
++        else
++        {
++            mRenderPipelineDesc.setInputPrimitiveTopology(MTLPrimitiveTopologyClassUnspecified);
++        }
+         mRenderPipelineDesc.setAlphaToCoverageEnabled(
+             mState.isSampleAlphaToCoverageEnabled() &&
+             mRenderPipelineDesc.outputDescriptor.getRasterSampleCount() > 1 &&
+diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+index f9d16a8e1a..db4dcab365 100644
+--- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
++++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+@@ -1227,6 +1227,25 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+         desc.stencilAttachment = {};
+     }
+ 
++    // VC multiview (Stufe 4a): a multiview framebuffer renders LAYERED — the
++    // instanced-emulation vertex shader routes every instance into its slice
++    // via [[render_target_array_index]]. The pass must declare the layer
++    // count, and the attachments must expose the array from slice 0: the
++    // shader adds the base view itself (ANGLE_multiviewBaseViewLayerIndex),
++    // so a non-zero attachment slice would double-offset.
++    desc.renderTargetArrayLength = 0;
++    if (mState.isMultiview())
++    {
++        desc.renderTargetArrayLength =
++            static_cast<uint32_t>(mState.getBaseViewIndex() + mState.getNumViews());
++        for (uint32_t i = 0; i < desc.numColorAttachments; ++i)
++        {
++            desc.colorAttachments[i].sliceOrDepth = 0;
++        }
++        desc.depthAttachment.sliceOrDepth   = 0;
++        desc.stencilAttachment.sliceOrDepth = 0;
++    }
++
+     // Klepton: variable rasterization rate. A pass is foveated when its FIRST
+     // colour attachment has a map registered (mtl_common.mm). Deliberately not a
+     // per-attachment property: Metal takes one map for the whole render pass, so
+diff --git a/src/libANGLE/renderer/metal/ShaderMtl.mm b/src/libANGLE/renderer/metal/ShaderMtl.mm
+index 5fb6ca47c0..e7da90ca25 100644
+--- a/src/libANGLE/renderer/metal/ShaderMtl.mm
++++ b/src/libANGLE/renderer/metal/ShaderMtl.mm
+@@ -88,6 +88,22 @@ void postTranslate(ShHandle compiler, const gl::CompiledShaderState &compiledSta
+         options->emulateAlphaToCoverage = true;
+     }
+ 
++    // VC multiview (Stufe 4a): the Metal backend serves OVR_multiview via the
++    // translator's instanced emulation — without this option the transform
++    // never runs and the emitted MSL references a bare gl_ViewID_OVR (found
++    // via the host-build link repro, 2026-09-24). No-op for shaders that do
++    // not declare num_views.
++    if (displayMtl->getNativeExtensions().multiviewOVR)
++    {
++        options->initializeBuiltinsForInstancedMultiview = true;
++        // Both options together are what GL's multiviewViaViewportArray path
++        // sets: the first computes ViewID/InstanceID from the doubled
++        // instances, the second routes gl_Layer. Since Stufe 3 the MSL
++        // emitter handles gl_Layer ([[render_target_array_index]]), so MSL is
++        // a legitimate target for the select-view transform.
++        options->selectViewInNvGLSLVertexShader = true;
++    }
++
+     options->removeInactiveVariables = true;
+     options->retainInactiveFragmentOutputs = true;
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.h b/src/libANGLE/renderer/metal/mtl_state_cache.h
+index f01038326b..0c1540d1bb 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.h
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.h
+@@ -745,6 +745,12 @@ struct RenderPassDesc
+     uint32_t defaultWidth        = 0;
+     uint32_t defaultHeight       = 0;
+ 
++    // VC multiview (Stufe 4a): layered rendering. Non-zero when the draw
++    // framebuffer is multiview; convertToMetalDesc forwards it so the
++    // instanced-multiview emulation's [[render_target_array_index]] writes
++    // have layers to land in.
++    uint32_t renderTargetArrayLength = 0;
++
+     // Klepton: variable rasterization rate. OWNING, and it has to be.
+     //
+     // This was __unsafe_unretained, on the premise that "the registry in
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+index 86b85f3183..d41d29455f 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+@@ -586,6 +586,12 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+         return false;
+     }
+ 
++    // VC multiview (Stufe 4a): a layer-count change is a render pass change.
++    if (renderTargetArrayLength != other.renderTargetArrayLength)
++    {
++        return false;
++    }
++
+     // Klepton: a rate map change is a render pass change. It cannot be set on an
+     // encoder after the fact, so an in-flight pass has to be ended and restarted
+     // — which is exactly what a false here causes.
+@@ -615,6 +621,7 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+     return depthAttachment == other.depthAttachment &&
+            stencilAttachment == other.stencilAttachment && defaultWidth == other.defaultWidth &&
+            defaultHeight == other.defaultHeight && rasterSampleCount == other.rasterSampleCount &&
++           renderTargetArrayLength == other.renderTargetArrayLength &&
+            rasterizationRateMap == other.rasterizationRateMap;
+ }
+ 
+@@ -642,6 +649,10 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+     ToObjC(depthAttachment, objCDesc.depthAttachment);
+     ToObjC(stencilAttachment, objCDesc.stencilAttachment);
+ 
++    // VC multiview (Stufe 4a): declare the layer count for layered rendering.
++    // Zero (the default) keeps every existing pass untouched.
++    objCDesc.renderTargetArrayLength = renderTargetArrayLength;
++
+     // Klepton: variable rasterization rate. Metal then rasterizes into the
+     // (smaller) physical region of the attachment while the viewport, the
+     // scissor and every screen-space coordinate stay in the map's SCREEN space —

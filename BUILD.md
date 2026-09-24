@@ -134,6 +134,20 @@ Fehlerrunden ≈ 45 Minuten. Auf Gerät abgenommen 2026-09-23: rev-Banner,
 Rate-Map-Spike 18/18 mit identischen Messwerten zum 26.5-Build, Bild
 korrekt, eye-GPU-Zeiten unverändert.
 
+## 8. Host-Build für Schreibtisch-Tests (macOS)
+
+Derselbe Baum baut mit `target_os = "mac"` (sonst gleiche gn-args) einen
+macOS-Metal-ANGLE als `libEGL.dylib`/`libGLESv2.dylib` plus das Host-Tool
+`angle_shader_translator`. Damit lassen sich GL-Läufe (Link, Draw, Readback)
+komplett ohne Gerät reproduzieren — Backend via
+`eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, {TYPE_METAL_ANGLE})`
+erzwingen (der macOS-Default kann der native-GL-Backend sein, in dem keine
+unserer Patches leben). Fehlertexte über `GL_KHR_debug`, das Laufzeit-MSL
+über `glGetTranslatedShaderSourceANGLE`. Achtung: `angle_shader_translator`
+aus einem iOS-out ist ein iOS-Binary — macOS beendet es kommentarlos mit
+SIGKILL. Bei Stufe 4a fand diese Schleife vier Defekte, die sonst je einen
+Gerätezyklus gekostet hätten.
+
 ## Laufzeit-Schalter der Patches
 
 | Variable | Wirkung |
