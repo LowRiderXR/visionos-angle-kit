@@ -1,0 +1,210 @@
+multiview-stage5.patch — Layered EGLImage-Import, Depth-Array, Pass-Break-Zaehler
+==================================================================================
+(Stufe 5.0a des Multiview-Plans, Docs/vicecity/multiview-plan.md — GENERISCH,
+keine Spiel-Annahmen; nutzbar von jedem Port, der eine Metal-Array-Textur als
+GL_TEXTURE_2D_ARRAY rendern will)
+
+Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Reihenfolge: nach klepton, angle-metal-fixes, multiview-stage2/3/4 anwenden.
+Stand:       5.0a (2026-09-25), am HOST verifiziert (macOS-Metal, Draw+Readback
+             per Metal-Blit): importiertes Private-2DArray + GL-eigenes
+             D24S8-Array, 2x MSAA, 2 Views -> COMPLETE; Depth-Test wirkt in
+             beiden Schichten; Foveation BY IDENTITY auf dem importierten
+             Metal-Objekt trifft direkt. Geraete-Bestaetigung ausstehend.
+
+Drei Bausteine:
+
+1. GL_EXT_EGL_image_array im Metal-Backend (DisplayMtl meldet es; Frontend-
+   Validation existierte bereits). ImageMtl: eine 2D-Array-MTLTexture, die
+   OHNE EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE importiert wird, bleibt ein Array
+   (gl::TextureType::_2DArray) und meldet arrayLength als Tiefe; MIT dem
+   Attribut ist sie wie bisher ein Slice. TextureMtl::setEGLImageTarget nimmt
+   den Array-Typ an und bietet fuer Alt-Importer einen Rueckfall: Array-Image
+   an GL_TEXTURE_2D gebunden = Slice 0 (frueheres Default-Verhalten).
+   Damit gilt: Klepton-Rate-Map by identity auf der Array-Textur registrieren,
+   GL-Array-Objekt drauf, Multiview-FBO — kein Slice-View, kein Umweg.
+2. Depth/Stencil als memoryless MS-Array: kein Code noetig — der 4b-Pfad
+   (MakeMemoryLess2DMSArrayTexture) traegt Depth-Formate; hier NACHGEWIESEN
+   (D24S8-Array via glFramebufferTextureMultisampleMultiviewOVR am
+   GL_DEPTH_STENCIL_ATTACHMENT, Depth-Test korrekt pro Schicht).
+3. Pass-Break-Zaehler (KL_ANGLE_VRR_TRACE): zaehlt pro Frame, wie oft ein
+   rate-gemappter oder layered Pass mit "save content" beendet wurde (= er
+   wird mit Load fortgesetzt; unter Rate Map der Doppelverzerrungs-Pfad).
+   Log bei flush: "[angle-vrr] passBreaks=N". Erwartung pro Frame = Zahl der
+   REGULAEREN Pass-Enden solcher Paesse (typisch 1); mehr = ein Encoder-Wechsel
+   mitten im Pass (Textur-Upload, Mipmap, Query).
+
+Host-Test-Hinweis: glReadPixels aus einer importierten PRIVATE-Textur nimmt
+auf macOS ohne das iOS-Feature copyTextureToBufferForReadOptimization den
+CPU-getBytes-Pfad und crasht ("CPU access ... Private ... disallowed") —
+Host-Tests lesen deshalb per Metal-Blit zurueck. Auf Geraet betrifft das
+nichts (Feature aktiv; Compositor liest Metal-seitig).
+
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 1663d18294..465ffc9b78 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -631,6 +631,12 @@ class ContextMtl : public ContextImpl, public mtl::Context
+ 
+     mtl::BufferManager mBufferManager;
+ 
++    // Diagnostic (KL_ANGLE_VRR_TRACE): how often a rate-mapped or layered render
++    // pass was ended WITH store mid-frame (i.e. broken and resumed with Load —
++    // under a rate map that is the double-warp unresolve path). Reported and
++    // reset at every flush.
++    uint32_t mFoveatedPassBreaks = 0;
++
+     // Lineloop and TriFan index buffer
+     mtl::BufferPool mLineLoopIndexBuffer;
+     mtl::BufferPool mLineLoopLastSegmentIndexBuffer;
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index a8d3bc930a..e15f4c4602 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -265,6 +265,13 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     // deferral to one frame; relying on "the next allocation outside a pass" was
+     // measured to be far weaker (episodes of ~500 deferrals, peak creeping to 177 MB).
+     mBufferManager.runPendingGC(this);
++    if (mtl::RasterizationRateTraceEnabled() && mFoveatedPassBreaks > 0)
++    {
++        fprintf(stderr, "[angle-vrr] passBreaks=%u rate-mapped/layered passes ended with store "
++                        "this frame (each resumes with Load)\n",
++                mFoveatedPassBreaks);
++    }
++    mFoveatedPassBreaks = 0;
+     return checkCommandBufferError();
+ }
+ angle::Result ContextMtl::finish(const gl::Context *context)
+@@ -1797,6 +1804,14 @@ static GLsizei AdjustInstancesForMultiview(const gl::State &glState, GLsizei ins
+ 
+     if (mRenderEncoder.valid())
+     {
++        // Pass-break counter: a rate-mapped/layered pass ended with "save
++        // content" is a pass that will resume with Load. Counted per frame,
++        // logged at flush (KL_ANGLE_VRR_TRACE).
++        if (forceSaveRenderPassContent &&
++            (mRenderEncoder.hasRateMap() || mRenderEncoder.isLayered()))
++        {
++            ++mFoveatedPassBreaks;
++        }
+         if (mtl::RasterizationRateTraceEnabled())
+         {
+             // Klepton: every render pass end funnels through here, so the return
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index f8771812ce..56632a176c 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -1017,6 +1017,9 @@ bool IsMetalDisplayAvailable()
+     mNativeExtensions.blendMinmaxEXT = true;
+ 
+     mNativeExtensions.EGLImageOES         = true;
++    // Layered EGLImage import as GL_TEXTURE_2D_ARRAY (see ImageMtl.mm). Frontend
++    // validation already exists; the Vulkan backend advertises it too.
++    mNativeExtensions.EGLImageArrayEXT    = true;
+     mNativeExtensions.EGLImageExternalOES = false;
+     // NOTE(hqle): Support GL_OES_EGL_image_external_essl3.
+     mNativeExtensions.EGLImageExternalEssl3OES = false;
+diff --git a/src/libANGLE/renderer/metal/ImageMtl.mm b/src/libANGLE/renderer/metal/ImageMtl.mm
+index 71017e47ad..d145072b0a 100644
+--- a/src/libANGLE/renderer/metal/ImageMtl.mm
++++ b/src/libANGLE/renderer/metal/ImageMtl.mm
+@@ -123,7 +123,14 @@
+ {
+     mNativeTexture = mtl::Texture::MakeFromMetal((__bridge id<MTLTexture>)(mBuffer));
+ 
+-    if (mNativeTexture->textureType() == MTLTextureType2DArray)
++    // EGL_EXT_image_array support (layered import): a 2D-array MTLTexture imported
++    // WITHOUT an explicit EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE attribute stays a
++    // whole array and can be bound to GL_TEXTURE_2D_ARRAY (layered render
++    // targets, OVR_multiview). With the attribute present it is one slice as
++    // before. Binding an un-sliced array to GL_TEXTURE_2D still works: TextureMtl
++    // falls back to a slice-0 view, so existing importers are unaffected.
++    if (mNativeTexture->textureType() == MTLTextureType2DArray &&
++        mAttribs.contains(EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE))
+     {
+         mtl::TextureRef baseTexture = std::move(mNativeTexture);
+         unsigned textureArraySlice =
+@@ -176,7 +183,18 @@
+ 
+ gl::Extents TextureImageSiblingMtl::getSize() const
+ {
+-    return mNativeTexture ? mNativeTexture->sizeAt0() : gl::Extents(0, 0, 0);
++    if (!mNativeTexture)
++    {
++        return gl::Extents(0, 0, 0);
++    }
++    gl::Extents size = mNativeTexture->sizeAt0();
++    // Metal's `depth` is 1 for 2D arrays; the GL image chain of a
++    // GL_TEXTURE_2D_ARRAY needs the layer count as depth.
++    if (mNativeTexture->textureType() == MTLTextureType2DArray)
++    {
++        size.depth = static_cast<int>(mNativeTexture->arrayLength());
++    }
++    return size;
+ }
+ 
+ size_t TextureImageSiblingMtl::getSamples() const
+@@ -218,9 +236,12 @@
+         switch (mNativeTexture->textureType())
+         {
+             case MTLTextureType2D:
+-            case MTLTextureType2DArray:
+                 mImageTextureType = gl::TextureType::_2D;
+                 break;
++            case MTLTextureType2DArray:
++                // Un-sliced array import (see TextureImageSiblingMtl::initImpl).
++                mImageTextureType = gl::TextureType::_2DArray;
++                break;
+             case MTLTextureTypeCube:
+                 mImageTextureType = gl::TextureType::CubeMap;
+                 break;
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index ba5aebbb90..e9aec4852c 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -1695,10 +1695,22 @@ uint32_t height(GLuint glLevel) const
+ 
+     ContextMtl *contextMtl = mtl::GetImpl(context);
+ 
+-    ImageMtl *imageMtl = mtl::GetImpl(image);
++    ImageMtl *imageMtl       = mtl::GetImpl(image);
++    mtl::TextureRef imageTex = imageMtl->getTexture();
+     if (type != imageMtl->getImageTextureType())
+     {
+-        return angle::Result::Stop;
++        // Compatibility: an un-sliced 2D-array image (EGL_EXT_image_array
++        // import) bound to GL_TEXTURE_2D behaves like the former default —
++        // slice 0.
++        if (type == gl::TextureType::_2D &&
++            imageMtl->getImageTextureType() == gl::TextureType::_2DArray)
++        {
++            imageTex = imageTex->createSliceMipView(0, mtl::kZeroNativeMipLevel);
++        }
++        else
++        {
++            return angle::Result::Stop;
++        }
+     }
+ 
+     const angle::FormatID angleFormatId =
+@@ -1706,7 +1718,7 @@ uint32_t height(GLuint glLevel) const
+     mtl::Format imageFormat = contextMtl->getPixelFormat(angleFormatId);
+ 
+     mNativeTextureStorage = std::make_unique<NativeTextureWrapperWithViewSupport>(
+-        imageMtl->getTexture(), /*baseGLLevel=*/0, imageFormat);
++        imageTex, /*baseGLLevel=*/0, imageFormat);
+ 
+     mSlices = mNativeTextureStorage->cubeFacesOrArrayLength();
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.h b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+index ca60e85dff..25f79c7a68 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.h
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+@@ -608,6 +608,7 @@ class RenderCommandEncoder final : public CommandEncoder
+     // line up -- measured as the rain flicker. Callers that would flush mid-pass for
+     // housekeeping ask this first and defer instead.
+     bool hasRateMap() const { return mHasRateMap; }
++    bool isLayered() const { return mIsLayered; }
+ 
+     uint64_t getSerial() const { return mSerial; }
+ 

@@ -27,8 +27,14 @@ Reihenfolge ist Pflicht:
 ```bash
 git apply <kit>/patches/klepton.patch
 git apply <kit>/patches/angle-metal-fixes.patch
-git apply <kit>/patches/multiview-stage2.patch   # optional: Multiview-Arbeit
+git apply <kit>/patches/multiview-stage2.patch   # optional ab hier: Multiview,
+git apply <kit>/patches/multiview-stage3.patch   #   in genau dieser Reihenfolge
+git apply <kit>/patches/multiview-stage4.patch
+git apply <kit>/patches/multiview-stage5.patch
 ```
+
+Prüfung der Kette auf frischem Baum (`git worktree add … e4499e6b28`, dann
+alle sechs nacheinander mit `git apply --check`) ist Teil jedes Exports.
 
 ## 3. Bauen
 
@@ -152,7 +158,8 @@ Gerätezyklus gekostet hätten.
 
 | Variable | Wirkung |
 |---|---|
-| `KL_ANGLE_VRR_TRACE=1` | Diagnose-Sonden an (Banner, encode/s, cmds/s, bufferGC, …) |
+| `KL_ANGLE_VRR_TRACE=1` | Diagnose-Sonden an (Banner, encode/s, cmds/s, bufferGC, `passBreaks=N` = rate-gemappte/geschichtete Pässe, die im Frame mit Store endeten und mit Load weitergehen — Ziel 0) |
+| `KL_GL_MULTIVIEW=1` | `GL_OVR_multiview/2` (+ `multisampled_render_to_texture`) melden; ohne die Variable sieht der Gast kein Multiview |
 | `KL_MTL_GC_DEFER=0` | GC-Aufschub aus (Referenzverhalten für A/B) |
 | `KL_MTL_GC_DEFER_CAP_MB` | Deckel des Aufschubs, Default 256 |
 | `KL_MTL_BUFFER_GC_MB` | GC-Speicherboden, Default 1 (nur Notausgang) |
