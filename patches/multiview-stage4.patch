@@ -5,12 +5,30 @@ multiview-stage4.patch — Draw-Verdrahtung der Multiview-Emulation
 Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
 Reihenfolge: nach klepton.patch, angle-metal-fixes.patch,
              multiview-stage2.patch und multiview-stage3.patch anwenden.
-Stand:       Stufe 4a KOMPLETT (2026-09-24), Ende-zu-Ende verifiziert am
-             HOST (macOS-Metal) UND auf GERAET (Vision Pro M5): voller
-             Draw+Readback-Test, plain und foveiert je 16/16 PASS,
-             subpixelgenau gegen die Map-Selbstauskunft, Werte auf beiden
-             Plattformen deckungsgleich. 4b (OVR_multiview_multisampled_
-             render_to_texture am impliziten MSAA-Pfad) folgt.
+Stand:       Stufe 4a+4b (2026-09-25). 4a Ende-zu-Ende verifiziert am HOST
+             (macOS-Metal) UND auf GERAET (Vision Pro M5): Draw+Readback,
+             plain und foveiert je 16/16 PASS, subpixelgenau, Werte auf
+             beiden Plattformen deckungsgleich. 4b (OVR_multiview_
+             multisampled_render_to_texture) am HOST verifiziert (vier
+             Varianten plain/fove x 1x/2xMSAA je 16/16 PASS) und auf
+             GERAET abgenommen (2026-09-25, OVERALL=PASS 64/64,
+             MSAA-FBO COMPLETE). Stufe 4 damit KOMPLETT.
+
+Zusaetzlich in 4b:
+8. mtl_resources: MakeMemoryLess2DMSArrayTexture; TextureMtl legt fuer
+   Multiview-Attachments (2DArray-Index) ein memoryless MS-ARRAY an —
+   layered Pass rendert hinein, Resolve laeuft pro Schicht (Basis-Slice 0;
+   auf Geraet schon im Stufe-1-Spike bewiesen).
+9. DisplayMtl meldet OVR_multiview_multisampled_render_to_texture
+   (im selben KL_GL_MULTIVIEW-Gate).
+10. Haertung: der Nicht-Dreieck-Skip greift auch in layered Paessen OHNE
+    Rate Map (Pipeline traegt dort Topologieklasse Triangle; Linien/Punkte
+    liefen sonst in einen Metal-Validierungsfehler).
+
+Unresolve-Regel (siehe angle-metal-fixes.patch / multiview-plan.md) gilt
+unveraendert: Multiview-MSAA-Paesse duerfen nie mit loadAction=Load
+starten; der GC-Aufschub greift auch fuer Multiview-Paesse (haengt am
+Rate-Map-Flag des Encoders, nicht am Pass-Typ).
 
 Bausteine (Muster: GL-Backend):
 
@@ -299,6 +317,22 @@ index 82a75fb177..a8d3bc930a 100644
          mRenderPipelineDesc.setAlphaToCoverageEnabled(
              mState.isSampleAlphaToCoverageEnabled() &&
              mRenderPipelineDesc.outputDescriptor.getRasterSampleCount() > 1 &&
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 10fcef1a3c..f8771812ce 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -989,6 +989,11 @@ bool IsMetalDisplayAvailable()
+     {
+         mNativeExtensions.multiviewOVR  = true;
+         mNativeExtensions.multiview2OVR = true;
++        // VC multiview (Stufe 4b): the multisampled variant, wired to the
++        // same implicit-MSAA path (memoryless MS array + resolve) the
++        // production eye passes already use via
++        // GL_EXT_multisampled_render_to_texture.
++        mNativeExtensions.multiviewMultisampledRenderToTextureOVR = true;
+     }
+ 
+     // EXT_debug_marker is not implemented yet, but the entry points must be exposed for the
 diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
 index f9d16a8e1a..db4dcab365 100644
 --- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
@@ -356,6 +390,174 @@ index 5fb6ca47c0..e7da90ca25 100644
      options->removeInactiveVariables = true;
      options->retainInactiveFragmentOutputs = true;
  
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 78947429da..ba5aebbb90 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -1444,8 +1444,21 @@ uint32_t height(GLuint glLevel) const
+         if (!msTexture)
+         {
+             const gl::ImageDesc &desc = mState.getImageDesc(imageIndex);
+-            ANGLE_TRY(mtl::Texture::MakeMemoryLess2DMSTexture(
+-                context, format, desc.size.width, desc.size.height, implicitSamples, &msTexture));
++            if (imageIndex.getType() == gl::TextureType::_2DArray)
++            {
++                // VC multiview (Stufe 4b): a multiview attachment renders
++                // LAYERED — the implicit multisample target must be an array
++                // covering every slice of the texture.
++                ANGLE_TRY(mtl::Texture::MakeMemoryLess2DMSArrayTexture(
++                    context, format, desc.size.width, desc.size.height,
++                    static_cast<uint32_t>(desc.size.depth), implicitSamples, &msTexture));
++            }
++            else
++            {
++                ANGLE_TRY(mtl::Texture::MakeMemoryLess2DMSTexture(context, format, desc.size.width,
++                                                                  desc.size.height, implicitSamples,
++                                                                  &msTexture));
++            }
+         }
+         rtt.setImplicitMSTexture(msTexture);
+     }
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.h b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+index e54dca6abe..ca60e85dff 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.h
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+@@ -655,6 +655,10 @@ class RenderCommandEncoder final : public CommandEncoder
+     // Klepton foveation: true while this pass has a rasterization rate map bound. Metal
+     // forbids non-triangle primitives under a rate map, so the draw* methods skip them.
+     bool mHasRateMap   = false;
++    // VC multiview (Stufe 4): layered pass (renderTargetArrayLength > 0). The
++    // pipeline then carries topology class Triangle, and Metal rejects any
++    // non-triangle draw against it — skip those like the rate-map case.
++    bool mIsLayered    = false;
+     IntermediateCommandStream mCommands;
+ 
+     gl::ShaderMap<uint8_t> mSetBufferCmds;
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index 32481a7599..05ffe0975f 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -1847,6 +1847,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     mHasDrawCalls             = false;
+     mNumDraws                 = 0;
+     mHasRateMap               = (desc.rasterizationRateMap.get() != nil);
++    mIsLayered                = (desc.renderTargetArrayLength > 0);
+     mRenderPassMaxScissorRect = {.x      = 0,
+                                  .y      = 0,
+                                  .width  = std::numeric_limits<NSUInteger>::max(),
+@@ -2214,7 +2215,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Klepton foveation: Metal allows only triangles under a rasterization rate map.
+     // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
+     // aborting; the world and coronas are triangles and draw normally.
+-    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++    if ((mHasRateMap || mIsLayered) && primitiveType != MTLPrimitiveTypeTriangle &&
+         primitiveType != MTLPrimitiveTypeTriangleStrip)
+         return *this;
+     mHasDrawCalls = true;
+@@ -2235,7 +2236,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Klepton foveation: Metal allows only triangles under a rasterization rate map.
+     // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
+     // aborting; the world and coronas are triangles and draw normally.
+-    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++    if ((mHasRateMap || mIsLayered) && primitiveType != MTLPrimitiveTypeTriangle &&
+         primitiveType != MTLPrimitiveTypeTriangleStrip)
+         return *this;
+     mHasDrawCalls = true;
+@@ -2262,7 +2263,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Klepton foveation: Metal allows only triangles under a rasterization rate map.
+     // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
+     // aborting; the world and coronas are triangles and draw normally.
+-    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++    if ((mHasRateMap || mIsLayered) && primitiveType != MTLPrimitiveTypeTriangle &&
+         primitiveType != MTLPrimitiveTypeTriangleStrip)
+         return *this;
+     mHasDrawCalls = true;
+@@ -2289,7 +2290,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Klepton foveation: Metal allows only triangles under a rasterization rate map.
+     // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
+     // aborting; the world and coronas are triangles and draw normally.
+-    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++    if ((mHasRateMap || mIsLayered) && primitiveType != MTLPrimitiveTypeTriangle &&
+         primitiveType != MTLPrimitiveTypeTriangleStrip)
+         return *this;
+     if (!indexBuffer)
+@@ -2324,7 +2325,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Klepton foveation: Metal allows only triangles under a rasterization rate map.
+     // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
+     // aborting; the world and coronas are triangles and draw normally.
+-    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++    if ((mHasRateMap || mIsLayered) && primitiveType != MTLPrimitiveTypeTriangle &&
+         primitiveType != MTLPrimitiveTypeTriangleStrip)
+         return *this;
+     if (!indexBuffer)
+@@ -2363,7 +2364,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Klepton foveation: Metal allows only triangles under a rasterization rate map.
+     // Silently skip lines/points on a rate-mapped pass (rain/markers/debug) instead of
+     // aborting; the world and coronas are triangles and draw normally.
+-    if (mHasRateMap && primitiveType != MTLPrimitiveTypeTriangle &&
++    if ((mHasRateMap || mIsLayered) && primitiveType != MTLPrimitiveTypeTriangle &&
+         primitiveType != MTLPrimitiveTypeTriangleStrip)
+         return *this;
+     if (!indexBuffer)
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.h b/src/libANGLE/renderer/metal/mtl_resources.h
+index 8916375318..786343a509 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.h
++++ b/src/libANGLE/renderer/metal/mtl_resources.h
+@@ -181,6 +181,16 @@ class Texture final : public Resource,
+                                                    uint32_t samples,
+                                                    TextureRef *refOut);
+ 
++    // VC multiview (Stufe 4b): memoryless multisample ARRAY target for the
++    // implicit-MSAA path of a multiview framebuffer.
++    static angle::Result MakeMemoryLess2DMSArrayTexture(ContextMtl *context,
++                                                        const Format &format,
++                                                        uint32_t width,
++                                                        uint32_t height,
++                                                        uint32_t arrayLength,
++                                                        uint32_t samples,
++                                                        TextureRef *refOut);
++
+     static angle::Result MakeCubeTexture(ContextMtl *context,
+                                          const Format &format,
+                                          uint32_t size,
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.mm b/src/libANGLE/renderer/metal/mtl_resources.mm
+index fcd258be2c..e76b1986c4 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.mm
++++ b/src/libANGLE/renderer/metal/mtl_resources.mm
+@@ -193,6 +193,33 @@ MTLResourceOptions resourceOptionsForStorageMode(MTLStorageMode storageMode)
+     }  // ANGLE_MTL_OBJC_SCOPE
+ }
+ /** static */
++angle::Result Texture::MakeMemoryLess2DMSArrayTexture(ContextMtl *context,
++                                                      const Format &format,
++                                                      uint32_t width,
++                                                      uint32_t height,
++                                                      uint32_t arrayLength,
++                                                      uint32_t samples,
++                                                      TextureRef *refOut)
++{
++    ANGLE_MTL_OBJC_SCOPE
++    {
++        // VC multiview (Stufe 4b): like MakeMemoryLess2DMSTexture, but an
++        // ARRAY so a layered (multiview) pass can render into it; the resolve
++        // walks the layers (device-verified in the stage-1 spike).
++        MTLTextureDescriptor *desc =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format.metalFormat
++                                                               width:width
++                                                              height:height
++                                                           mipmapped:NO];
++        desc.textureType = MTLTextureType2DMultisampleArray;
++        desc.arrayLength = arrayLength;
++        desc.sampleCount = samples;
++
++        return MakeTexture(context, format, desc, 1, /*renderTargetOnly=*/true,
++                           /*allowFormatView=*/false, /*memoryLess=*/true, refOut);
++    }  // ANGLE_MTL_OBJC_SCOPE
++}
++/** static */
+ angle::Result Texture::MakeCubeTexture(ContextMtl *context,
+                                        const Format &format,
+                                        uint32_t size,
 diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.h b/src/libANGLE/renderer/metal/mtl_state_cache.h
 index f01038326b..0c1540d1bb 100644
 --- a/src/libANGLE/renderer/metal/mtl_state_cache.h
