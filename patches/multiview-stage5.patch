@@ -1,4 +1,4 @@
-multiview-stage5.patch — Layered EGLImage-Import, Depth-Array, Pass-Break-Zaehler
+multiview-stage5.patch — Layered EGLImage-Import, Depth-Array, Pass-Break-Zaehler, Load-Action-Sonde
 ==================================================================================
 (Stufe 5.0a des Multiview-Plans, Docs/vicecity/multiview-plan.md — GENERISCH,
 keine Spiel-Annahmen; nutzbar von jedem Port, der eine Metal-Array-Textur als
@@ -10,9 +10,11 @@ Stand:       5.0a (2026-09-25), am HOST verifiziert (macOS-Metal, Draw+Readback
              per Metal-Blit): importiertes Private-2DArray + GL-eigenes
              D24S8-Array, 2x MSAA, 2 Views -> COMPLETE; Depth-Test wirkt in
              beiden Schichten; Foveation BY IDENTITY auf dem importierten
-             Metal-Objekt trifft direkt. Geraete-Bestaetigung ausstehend.
+             Metal-Objekt trifft direkt. Auf Geraet (Vision Pro M5, visionOS
+             26.6) bestaetigt 2026-09-25: identische Messwerte.
+             Nachtrag 5.0b/4: Baustein 4 (Load-Action-Sonde).
 
-Drei Bausteine:
+Vier Bausteine:
 
 1. GL_EXT_EGL_image_array im Metal-Backend (DisplayMtl meldet es; Frontend-
    Validation existierte bereits). ImageMtl: eine 2D-Array-MTLTexture, die
@@ -39,6 +41,17 @@ auf macOS ohne das iOS-Feature copyTextureToBufferForReadOptimization den
 CPU-getBytes-Pfad und crasht ("CPU access ... Private ... disallowed") —
 Host-Tests lesen deshalb per Metal-Blit zurueck. Auf Geraet betrifft das
 nichts (Feature aktiv; Compositor liest Metal-seitig).
+
+4. Load-Action-Sonde (KL_ANGLE_VRR_TRACE, mtl_command_buffer.mm): zaehlt fuer
+   jeden Render-Pass mit Rate Map ODER Layer-Rendering die Load-Actions von
+   color0/depth/stencil aus dem KONVERTIERTEN MTLRenderPassDescriptor und
+   druckt sie einmal pro Sekunde neben encode/s:
+     [angle-vrr] passLoads/s rate-mapped|layered passes=N color Clear/Load/DontCare=a/b/c depth=... stencil=...
+   Zweck: die Clear-Hygiene eines Gastes messen statt annehmen. Ein Load auf
+   einem memoryless Attachment ist entweder eine geplante Passgrenze (unter
+   Rate Map: doppelt gewarpter Unresolve) oder ein uebersprungener Clear
+   (Schreibmaske/Scissor zur glClear-Zeit). Sollbild fuer einen Augen-/
+   Multiview-Pass: Clear/Clear/Clear, Load = 0.
 
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
 index 1663d18294..465ffc9b78 100644
@@ -207,4 +220,67 @@ index ca60e85dff..25f79c7a68 100644
 +    bool isLayered() const { return mIsLayered; }
  
      uint64_t getSerial() const { return mSerial; }
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index 05ffe0975f..4f7623ab3c 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -969,6 +969,20 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     resource->setUsedByCommandBufferWithQueueSerial(mQueueSerial, false, isRenderCommand);
+ }
+ 
++// Klepton/multiview probe (KL_ANGLE_VRR_TRACE=1): load actions of every render
++// pass that carries a rasterization rate map or renders layered. Anything but
++// Clear on a memoryless attachment means either a planned Load (which on a
++// rate-mapped memoryless target re-warps the unresolve, see angle-metal-fixes)
++// or a skipped clear (write masks / scissor at glClear time). Tallied here per
++// pass, printed once per second next to encode/s. Index [attachment][action]:
++// attachment 0 color0, 1 depth, 2 stencil; action 0 Clear, 1 Load, 2 DontCare.
++static size_t klPassLoads[3][3]  = {};
++static size_t klPassLoadsPasses  = 0;
++static inline int klLoadActionIndex(MTLLoadAction a)
++{
++    return a == MTLLoadActionClear ? 0 : (a == MTLLoadActionLoad ? 1 : 2);
++}
++
+ bool CommandBuffer::needsFlushForDrawCallLimits() const
+ {
+     // Klepton: despite the name this is a RESIDENT MEMORY check, not a draw
+@@ -1810,6 +1824,17 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+                 fprintf(stderr, "\n");
+                 memset(klCmdCount, 0, sizeof(klCmdCount));
+ 
++                fprintf(stderr,
++                        "[angle-vrr] passLoads/s rate-mapped|layered passes=%zu "
++                        "color Clear/Load/DontCare=%zu/%zu/%zu depth=%zu/%zu/%zu "
++                        "stencil=%zu/%zu/%zu\n",
++                        klPassLoadsPasses, klPassLoads[0][0], klPassLoads[0][1],
++                        klPassLoads[0][2], klPassLoads[1][0], klPassLoads[1][1],
++                        klPassLoads[1][2], klPassLoads[2][0], klPassLoads[2][1],
++                        klPassLoads[2][2]);
++                memset(klPassLoads, 0, sizeof(klPassLoads));
++                klPassLoadsPasses = 0;
++
+                 sumUs = worstUs = 0.0;
+                 passes = draws = worstDraws = 0;
+                 windowStart                 = nowSec;
+@@ -1865,6 +1890,19 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     // Convert to Objective-C descriptor
+     mRenderPassDesc.convertToMetalDesc(mCachedRenderPassDescObjC, deviceMaxRenderTargets);
+ 
++    if ((mHasRateMap || mIsLayered) && RasterizationRateTraceEnabled())
++    {
++        // Read the CONVERTED descriptor: that is what Metal will execute.
++        MTLRenderPassDescriptor *d = mCachedRenderPassDescObjC.get();
++        ++klPassLoadsPasses;
++        if (d.colorAttachments[0].texture)
++            ++klPassLoads[0][klLoadActionIndex(d.colorAttachments[0].loadAction)];
++        if (d.depthAttachment.texture)
++            ++klPassLoads[1][klLoadActionIndex(d.depthAttachment.loadAction)];
++        if (d.stencilAttachment.texture)
++            ++klPassLoads[2][klLoadActionIndex(d.stencilAttachment.loadAction)];
++    }
++
+     // The actual Objective-C encoder will be created later in endEncoding(), we do so in order
+     // to be able to sort the commands or do the preprocessing before the actual encoding.
  

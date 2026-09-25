@@ -158,7 +158,7 @@ Gerätezyklus gekostet hätten.
 
 | Variable | Wirkung |
 |---|---|
-| `KL_ANGLE_VRR_TRACE=1` | Diagnose-Sonden an (Banner, encode/s, cmds/s, bufferGC, `passBreaks=N` = rate-gemappte/geschichtete Pässe, die im Frame mit Store endeten und mit Load weitergehen — Ziel 0) |
+| `KL_ANGLE_VRR_TRACE=1` | Diagnose-Sonden an (Banner, encode/s, cmds/s, bufferGC, `passBreaks=N` = rate-gemappte/geschichtete Pässe, die im Frame mit Store endeten und mit Load weitergehen — Ziel 0; `passLoads/s` = Load-Actions color/depth/stencil dieser Pässe pro Sekunde, Sollbild Clear/Clear/Clear) |
 | `KL_GL_MULTIVIEW=1` | `GL_OVR_multiview/2` (+ `multisampled_render_to_texture`) melden; ohne die Variable sieht der Gast kein Multiview |
 | `KL_MTL_GC_DEFER=0` | GC-Aufschub aus (Referenzverhalten für A/B) |
 | `KL_MTL_GC_DEFER_CAP_MB` | Deckel des Aufschubs, Default 256 |
