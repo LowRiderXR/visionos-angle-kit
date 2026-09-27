@@ -1,4 +1,4 @@
-multiview-stage5.patch — Layered EGLImage-Import, Depth-Array, Pass-Break-Zaehler, Load-Action-Sonde
+multiview-stage5.patch — Layered EGLImage-Import, Depth-Array, Pass-Break-Zaehler, Load-Action-Sonde, Frame-GPU-Zeit
 ==================================================================================
 (Stufe 5.0a des Multiview-Plans, Docs/vicecity/multiview-plan.md — GENERISCH,
 keine Spiel-Annahmen; nutzbar von jedem Port, der eine Metal-Array-Textur als
@@ -14,7 +14,7 @@ Stand:       5.0a (2026-09-25), am HOST verifiziert (macOS-Metal, Draw+Readback
              26.6) bestaetigt 2026-09-25: identische Messwerte.
              Nachtrag 5.0b/4: Baustein 4 (Load-Action-Sonde).
 
-Vier Bausteine:
+Fuenf Bausteine:
 
 1. GL_EXT_EGL_image_array im Metal-Backend (DisplayMtl meldet es; Frontend-
    Validation existierte bereits). ImageMtl: eine 2D-Array-MTLTexture, die
@@ -53,11 +53,32 @@ nichts (Feature aktiv; Compositor liest Metal-seitig).
    (Schreibmaske/Scissor zur glClear-Zeit). Sollbild fuer einen Augen-/
    Multiview-Pass: Clear/Clear/Clear, Load = 0.
 
+5. Frame-GPU-Zeit ohne GL-Query (KL_MTL_FRAME_GPU_TIME=1; mtl_common.h/.mm,
+   ContextMtl.h/.mm): ContextMtl::flush() (= glFlush des Gastes, einer pro
+   Frame) schliesst die laufende TimeElapsed-Entry und oeffnet die naechste;
+   die Entry summiert wie bei GL_TIME_ELAPSED GPUEndTime-GPUStartTime ueber
+   alle Command Buffer des Frames. Fertige Frames liegen in einem Ring, der
+   Gast holt sie per dlsym:
+     extern "C" int ANGLEMetalPopFrameGpuTimeMs(double *outMs);  // 1 = Wert geliefert
+   Zweck: OVR_multiview verbietet eine aktive GL_TIME_ELAPSED-Query waehrend
+   Multiview-Draws (kMultiviewTimerQuery) -- diese Sonde misst identisch,
+   vorher und nachher, ohne Spec-Abweichung. Nicht zusammen mit GL-
+   TimeElapsed-Queries benutzen (beide steuern die eine aktive Entry der
+   CommandQueue).
+
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
-index 1663d18294..465ffc9b78 100644
+index 1663d18294..bedb6753d5 100644
 --- a/src/libANGLE/renderer/metal/ContextMtl.h
 +++ b/src/libANGLE/renderer/metal/ContextMtl.h
-@@ -631,6 +631,12 @@ class ContextMtl : public ContextImpl, public mtl::Context
+@@ -14,6 +14,7 @@
+ #import <mach/mach_types.h>
+ 
+ #include "common/Optional.h"
++#include <deque>
+ #include "image_util/loadimage.h"
+ #include "libANGLE/Context.h"
+ #include "libANGLE/renderer/ContextImpl.h"
+@@ -631,6 +632,18 @@ class ContextMtl : public ContextImpl, public mtl::Context
  
      mtl::BufferManager mBufferManager;
  
@@ -67,14 +88,20 @@ index 1663d18294..465ffc9b78 100644
 +    // reset at every flush.
 +    uint32_t mFoveatedPassBreaks = 0;
 +
++    // Frame GPU time probe (KL_MTL_FRAME_GPU_TIME, see mtl_common.h): the
++    // TimeElapsed entry covering the frame being recorded, and the closed ones
++    // still waiting for their command buffers to complete.
++    uint64_t mFrameGpuEntry = 0;
++    std::deque<uint64_t> mFrameGpuPending;
++
      // Lineloop and TriFan index buffer
      mtl::BufferPool mLineLoopIndexBuffer;
      mtl::BufferPool mLineLoopLastSegmentIndexBuffer;
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
-index a8d3bc930a..e15f4c4602 100644
+index a8d3bc930a..04be471ac0 100644
 --- a/src/libANGLE/renderer/metal/ContextMtl.mm
 +++ b/src/libANGLE/renderer/metal/ContextMtl.mm
-@@ -265,6 +265,13 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+@@ -265,6 +265,35 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
      // deferral to one frame; relying on "the next allocation outside a pass" was
      // measured to be far weaker (episodes of ~500 deferrals, peak creeping to 177 MB).
      mBufferManager.runPendingGC(this);
@@ -85,10 +112,32 @@ index a8d3bc930a..e15f4c4602 100644
 +                mFoveatedPassBreaks);
 +    }
 +    mFoveatedPassBreaks = 0;
++
++    // Frame GPU time (KL_MTL_FRAME_GPU_TIME): this flush is the frame boundary.
++    // Close the entry of the frame just committed, harvest completed ones, open
++    // the next. An entry with no command buffers completes instantly with 0 ms.
++    if (mtl::FrameGpuTimeEnabled())
++    {
++        mtl::CommandQueue &q = mCmdBuffer.cmdQueue();
++        if (mFrameGpuEntry != 0)
++        {
++            mFrameGpuPending.push_back(mFrameGpuEntry);
++        }
++        while (!mFrameGpuPending.empty() && q.isTimeElapsedEntryComplete(mFrameGpuPending.front()))
++        {
++            const uint64_t id = mFrameGpuPending.front();
++            mFrameGpuPending.pop_front();
++            const double seconds = q.getTimeElapsedEntryInSeconds(id);
++            q.deleteTimeElapsedEntry(id);
++            mtl::PushFrameGpuTimeMs(seconds * 1000.0);
++        }
++        mFrameGpuEntry = q.allocateTimeElapsedEntry();
++        q.setActiveTimeElapsedEntry(mFrameGpuEntry);
++    }
      return checkCommandBufferError();
  }
  angle::Result ContextMtl::finish(const gl::Context *context)
-@@ -1797,6 +1804,14 @@ static GLsizei AdjustInstancesForMultiview(const gl::State &glState, GLsizei ins
+@@ -1797,6 +1826,14 @@ static GLsizei AdjustInstancesForMultiview(const gl::State &glState, GLsizei ins
  
      if (mRenderEncoder.valid())
      {
@@ -284,3 +333,93 @@ index 05ffe0975f..4f7623ab3c 100644
      // The actual Objective-C encoder will be created later in endEncoding(), we do so in order
      // to be able to sort the commands or do the preprocessing before the actual encoding.
  
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index 1b76b7ee38..fa8a394fa1 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -527,6 +527,17 @@ bool AnyRasterizationRateMapsRegistered();
+ // KL_ANGLE_VRR_TRACE=1. Read once: this is consulted on a per-render-pass path.
+ bool RasterizationRateTraceEnabled();
+ 
++// Frame GPU time without a GL query (KL_MTL_FRAME_GPU_TIME=1). ContextMtl::flush()
++// (= the guest's glFlush, one per frame) closes the running TimeElapsed entry and
++// opens the next one; the entry machinery already sums GPUEndTime-GPUStartTime over
++// every command buffer created meanwhile. Completed frames are queued here and
++// popped by the host via ANGLEMetalPopFrameGpuTimeMs(). Needed where a live
++// GL_TIME_ELAPSED query is forbidden (OVR_multiview draws) and for a measurement
++// that is identical before and after such a change. Mutually exclusive with GL
++// TimeElapsed queries (both drive CommandQueue's single active entry).
++bool FrameGpuTimeEnabled();
++void PushFrameGpuTimeMs(double ms);
++
+ #define ANGLE_MTL_CHECK(context, result, nserror)                                   \
+     do                                                                              \
+     {                                                                               \
+diff --git a/src/libANGLE/renderer/metal/mtl_common.mm b/src/libANGLE/renderer/metal/mtl_common.mm
+index 89b099b5ae..57e4a90db7 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.mm
++++ b/src/libANGLE/renderer/metal/mtl_common.mm
+@@ -319,6 +319,63 @@ void SetRasterizationRateMapForSize(uint32_t width,
+                                         (id<MTLRasterizationRateMap>)mtlRateMap);
+ }
+ 
++namespace rx
++{
++namespace mtl
++{
++bool FrameGpuTimeEnabled()
++{
++    static const bool enabled = [] {
++        const char *e = getenv("KL_MTL_FRAME_GPU_TIME");
++        return e && e[0] == '1';
++    }();
++    return enabled;
++}
++
++namespace
++{
++struct FrameGpuTimeRing
++{
++    std::mutex lock;
++    double ms[64];
++    unsigned head = 0, count = 0;   // ring: oldest dropped when full
++};
++FrameGpuTimeRing &GetFrameGpuTimeRing()
++{
++    // Leaked singleton on purpose: no exit-time destructor (-Werror in this tree).
++    static FrameGpuTimeRing *ring = new FrameGpuTimeRing();
++    return *ring;
++}
++}  // namespace
++
++void PushFrameGpuTimeMs(double ms)
++{
++    FrameGpuTimeRing &r = GetFrameGpuTimeRing();
++    std::lock_guard<std::mutex> guard(r.lock);
++    r.ms[(r.head + r.count) % 64] = ms;
++    if (r.count < 64)
++        ++r.count;
++    else
++        r.head = (r.head + 1) % 64;
++}
++}  // namespace mtl
++}  // namespace rx
++
++// Host-side reader (dlsym, plain C): pops the oldest completed frame's GPU time in
++// milliseconds. Returns 1 if one was available, 0 otherwise.
++extern "C" __attribute__((visibility("default"))) int ANGLEMetalPopFrameGpuTimeMs(double *outMs)
++{
++    rx::mtl::FrameGpuTimeRing &r = rx::mtl::GetFrameGpuTimeRing();
++    std::lock_guard<std::mutex> guard(r.lock);
++    if (r.count == 0)
++        return 0;
++    if (outMs)
++        *outMs = r.ms[r.head];
++    r.head = (r.head + 1) % 64;
++    --r.count;
++    return 1;
++}
++
+ // Every colour render target of exactly this size gets this map. See the header
+ // for why the size, and not the object, is the workable key for the guest's
+ // multisampled scene target.

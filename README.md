@@ -14,7 +14,7 @@ Das Verfahren steht in [BUILD.md](BUILD.md).
 | `patches/multiview-stage2.patch` | GL_OVR_multiview/2 melden (Stufe 2, ohne Wirkung; nur mit `KL_GL_MULTIVIEW=1`) | eigener Code |
 | `patches/multiview-stage3.patch` | gl_ViewID_OVR/gl_Layer im MSL-Übersetzer (Instanz-Emulation vollständig; Laufzeitwirkung erst mit Stufe 4) | eigener Code, Details im Patch-Kopf |
 | `patches/multiview-stage4.patch` | Draw-Verdrahtung: Instanzen ×numViews, layered Pass, Layer-Basis-Uniform, memoryless MSAA-Arrays (4a+4b) | eigener Code, Details im Patch-Kopf |
-| `patches/multiview-stage5.patch` | Generische Bausteine für Multiview auf System-Targets: `GL_EXT_EGL_image_array` (2D-Array-MTLTexture ohne Slice-Attribut → `GL_TEXTURE_2D_ARRAY`, dieselbe MTLTexture), Pass-Abbruch-Zähler `passBreaks` und Load-Action-Sonde `passLoads/s` unter `KL_ANGLE_VRR_TRACE` | eigener Code, Details im Patch-Kopf |
+| `patches/multiview-stage5.patch` | Generische Bausteine für Multiview auf System-Targets: `GL_EXT_EGL_image_array` (2D-Array-MTLTexture ohne Slice-Attribut → `GL_TEXTURE_2D_ARRAY`, dieselbe MTLTexture), Pass-Abbruch-Zähler `passBreaks` und Load-Action-Sonde `passLoads/s` unter `KL_ANGLE_VRR_TRACE`, Frame-GPU-Zeit ohne GL-Query (`KL_MTL_FRAME_GPU_TIME`, `ANGLEMetalPopFrameGpuTimeMs`) | eigener Code, Details im Patch-Kopf |
 | `gn-args/device.gn` | gn-Argumente für den Gerätebau (iOS-Route, dann Retarget) | — |
 | `gn-args/simulator.gn` | gn-Argumente für den Simulatorbau | — |
 
