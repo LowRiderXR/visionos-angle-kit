@@ -27,9 +27,11 @@ Das Verfahren steht in [BUILD.md](BUILD.md).
   `multiview-stage4.patch` → `multiview-stage5.patch` (die multiview-Patches
   optional, in dieser Reihenfolge; nur für Multiview-Arbeit. Sie enthalten
   keine Spielannahmen — ein anderer Port nutzt sie unverändert).
-- Verwendet von: AvpViceCity (Xcode-Projekt referenziert
-  `Prototypes/angle-src/Frameworks/`; `Prototypes/angle-patches/` ist ein
-  Symlink auf `patches/` hier).
+- Verwendet von: [revc-visionos-app](https://github.com/LowRiderXR/revc-visionos-app)
+  (Xcode-Projekt `AvpViceCity`, bindet die fertigen xcframeworks unter
+  `ThirdParty/ANGLE/` ein; sie liegen als Release-Assets dort und werden von
+  dessen `setup.sh` mit Prüfsummen geladen). Entwicklungsseitig ist
+  `Prototypes/angle-patches/` ein Symlink auf `patches/` hier.
 
 Projektspezifische Hintergründe (Messungen, Entscheidungswege) liegen im
 privaten Docs-Repo `visionos-ports-docs` (`vicecity/angle-build.md`,
