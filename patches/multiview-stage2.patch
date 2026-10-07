@@ -1,25 +1,25 @@
-multiview-stage2.patch — GL_OVR_multiview/2 im ANGLE-Metal-Backend melden
+multiview-stage2.patch — advertise GL_OVR_multiview/2 in the ANGLE Metal backend
 ==========================================================================
-(Stufe 2 des Multiview-Plans, Docs/vicecity/multiview-plan.md)
+(stage 2 of the multiview plan of the Vice City port)
 
-Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
-Reihenfolge: nach klepton.patch UND angle-metal-fixes.patch anwenden.
-Stand:       Stufe 2 KOMPLETT (2026-09-23) — Extension melden, NOCH OHNE
-             WIRKUNG: der Gast sieht GL_OVR_multiview/multiview2 und
-             MAX_VIEWS_OVR=2, Draws landen weiterhin einaeugig.
-             Teil 2 (Multiview-Attachment annehmen) brauchte KEINE
-             Backend-Aenderung: glFramebufferTextureMultiviewOVR auf ein
-             64x64x2-Array mit zwei Views liefert COMPLETE ohne GL-Fehler
-             (Gast-Selbsttest in visionos_angle.mm, Geraet 2026-09-23) —
-             FramebufferMtl/TextureMtl verkraften den 2DArrayRange-Index
-             von Haus aus (Render-Target = Basis-Schicht). Dieser Patch
-             bleibt deshalb nur die Meldung; Stufe 3+ (gl_ViewID_OVR im
-             Shader) folgt separat.
+Base:        ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Order:       apply after klepton.patch AND angle-metal-fixes.patch.
+State:       stage 2 COMPLETE (2026-09-23) — the extension is advertised,
+             STILL WITHOUT EFFECT: the guest sees GL_OVR_multiview/multiview2
+             and MAX_VIEWS_OVR=2, draws still land in one eye.
+             Part 2 (accepting a multiview attachment) needed NO backend
+             change: glFramebufferTextureMultiviewOVR on a 64x64x2 array
+             with two views returns COMPLETE without a GL error (guest
+             self-test in visionos_angle.mm, device 2026-09-23) —
+             FramebufferMtl/TextureMtl handle the 2DArrayRange index out of
+             the box (render target = base layer). This patch therefore
+             stays the announcement only; stage 3+ (gl_ViewID_OVR in the
+             shader) follows separately.
 
-Aktivierung: NUR mit Umgebungsvariable KL_GL_MULTIVIEW=1 (Default: aus —
-             ohne die Variable aendert sich die Extension-Zeichenkette
-             nicht). Auf Geraet verifiziert 2026-09-23 (Gast sieht beide
-             Extensions aktiv, MAX_VIEWS_OVR=2, Spiel unauffaellig).
+Activation:  ONLY with the environment variable KL_GL_MULTIVIEW=1 (default:
+             off — without the variable the extension string does not
+             change). Verified on the device 2026-09-23 (guest sees both
+             extensions active, MAX_VIEWS_OVR=2, game unaffected).
 
 diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
 index dbc9481363..10fcef1a3c 100644

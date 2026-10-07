@@ -1,68 +1,69 @@
-multiview-stage4.patch — Draw-Verdrahtung der Multiview-Emulation
+multiview-stage4.patch — draw wiring of the multiview emulation
 ==================================================================
-(Stufe 4 des Multiview-Plans, Docs/vicecity/multiview-plan.md)
+(stage 4 of the multiview plan of the Vice City port)
 
-Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
-Reihenfolge: nach klepton.patch, angle-metal-fixes.patch,
-             multiview-stage2.patch und multiview-stage3.patch anwenden.
-Stand:       Stufe 4a+4b (2026-09-25). 4a Ende-zu-Ende verifiziert am HOST
-             (macOS-Metal) UND auf GERAET (Vision Pro M5): Draw+Readback,
-             plain und foveiert je 16/16 PASS, subpixelgenau, Werte auf
-             beiden Plattformen deckungsgleich. 4b (OVR_multiview_
-             multisampled_render_to_texture) am HOST verifiziert (vier
-             Varianten plain/fove x 1x/2xMSAA je 16/16 PASS) und auf
-             GERAET abgenommen (2026-09-25, OVERALL=PASS 64/64,
-             MSAA-FBO COMPLETE). Stufe 4 damit KOMPLETT.
+Base:        ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Order:       apply after klepton.patch, angle-metal-fixes.patch,
+             multiview-stage2.patch and multiview-stage3.patch.
+State:       stage 4a+4b (2026-09-25). 4a verified end to end on the HOST
+             (macOS Metal) AND on the DEVICE (Vision Pro M5): draw + readback,
+             plain and foveated 16/16 PASS each, sub-pixel accurate, values
+             identical on both platforms. 4b (OVR_multiview_multisampled_
+             render_to_texture) verified on the HOST (four variants plain/fove
+             x 1x/2x MSAA, 16/16 PASS each) and accepted on the DEVICE
+             (2026-09-25, OVERALL=PASS 64/64, MSAA FBO COMPLETE). Stage 4 is
+             therefore COMPLETE.
 
-Zusaetzlich in 4b:
-8. mtl_resources: MakeMemoryLess2DMSArrayTexture; TextureMtl legt fuer
-   Multiview-Attachments (2DArray-Index) ein memoryless MS-ARRAY an —
-   layered Pass rendert hinein, Resolve laeuft pro Schicht (Basis-Slice 0;
-   auf Geraet schon im Stufe-1-Spike bewiesen).
-9. DisplayMtl meldet OVR_multiview_multisampled_render_to_texture
-   (im selben KL_GL_MULTIVIEW-Gate).
-10. Haertung: der Nicht-Dreieck-Skip greift auch in layered Paessen OHNE
-    Rate Map (Pipeline traegt dort Topologieklasse Triangle; Linien/Punkte
-    liefen sonst in einen Metal-Validierungsfehler).
+Additionally in 4b:
+8. mtl_resources: MakeMemoryLess2DMSArrayTexture; TextureMtl creates a
+   memoryless MS ARRAY for multiview attachments (2DArray index) — the
+   layered pass renders into it, the resolve runs per layer (base slice 0;
+   already proven on the device in the stage 1 spike).
+9. DisplayMtl advertises OVR_multiview_multisampled_render_to_texture
+   (behind the same KL_GL_MULTIVIEW gate).
+10. Hardening: the non-triangle skip also applies in layered passes WITHOUT
+    a rate map (the pipeline carries topology class Triangle there;
+    lines/points otherwise ran into a Metal validation error).
 
-Unresolve-Regel (siehe angle-metal-fixes.patch / multiview-plan.md) gilt
-unveraendert: Multiview-MSAA-Paesse duerfen nie mit loadAction=Load
-starten; der GC-Aufschub greift auch fuer Multiview-Paesse (haengt am
-Rate-Map-Flag des Encoders, nicht am Pass-Typ).
+The unresolve rule (see angle-metal-fixes.patch) applies unchanged:
+multiview MSAA passes must never start with loadAction=Load; the deferred GC
+also covers multiview passes (keyed on the encoder's rate-map flag, not on
+the pass type).
 
-Bausteine (Muster: GL-Backend):
+Building blocks (pattern: the GL backend):
 
-1. ContextMtl: Draws in Multiview-FBOs laufen instanced x numViews
-   (AdjustInstancesForMultiview in beiden Draw-Trichteln); Pipeline bekommt
-   inputPrimitiveTopology=Triangle (Metal verwirft render_target_array_index
-   sonst STILL, alles landet in Slice 0 — Host-Repro-Befund; bekannte
-   Limitation: Linien/Punkte in Multiview-FBOs braeuchten den echten Mode);
-   handleDirtyDriverUniforms fuellt multiviewBaseViewIndex.
-2. FrameBufferMtl::prepareRenderPass: Multiview-FBO => layered Pass
-   (renderTargetArrayLength, Attachments ab Slice 0).
-3. mtl_state_cache: renderTargetArrayLength in RenderPassDesc
-   (Vergleich + Metal-Konvertierung), Default 0 = unveraendert.
-4. ShaderMtl: setzt initializeBuiltinsForInstancedMultiview UND
-   selectViewInNvGLSLVertexShader, wenn die Extension aktiv ist — ohne
-   Ersteres laeuft die Emulation gar nicht (nacktes gl_ViewID_OVR im MSL),
-   ohne Zweiteres fehlt die gl_Layer-Zuweisung.
-5. Transform-ASSERT um MSL-Ausgabe erweitert (selectView war GLSL/ESSL-only).
-6. TranslatorMSL: (a) Multiview-Vertex-Shader bekommen KEIN [[point_size]]
-   (Metal verbietet point_size + spezifizierte Topologieklasse; Layered
-   Rendering braucht die Klasse — GL_POINTS in Multiview-FBOs geopfert);
-   (b) das interne multiviewBaseViewLayerIndex-USER-Uniform wird entfernt
-   und auf ein Driver-Uniform-Feld umgeschrieben — als User-Uniform
-   verschob es das MSL-Block-Layout gegen die Frontend-Layout-Map und alle
-   echten User-Uniforms kamen als Null an (Host-Repro-Befund).
-7. DriverUniformMetal: Spare-uvec2 gesplittet in multiviewBaseViewIndex(int)
-   + unused(uint), Getter; Laufzeit-Struct in ContextMtl.h synchron.
+1. ContextMtl: draws into multiview FBOs run instanced x numViews
+   (AdjustInstancesForMultiview in both draw funnels); the pipeline gets
+   inputPrimitiveTopology=Triangle (Metal otherwise SILENTLY drops
+   render_target_array_index and everything lands in slice 0 — host repro
+   finding; known limitation: lines/points in multiview FBOs would need the
+   real mode); handleDirtyDriverUniforms fills multiviewBaseViewIndex.
+2. FrameBufferMtl::prepareRenderPass: multiview FBO => layered pass
+   (renderTargetArrayLength, attachments from slice 0).
+3. mtl_state_cache: renderTargetArrayLength in RenderPassDesc (comparison +
+   Metal conversion), default 0 = unchanged.
+4. ShaderMtl: sets initializeBuiltinsForInstancedMultiview AND
+   selectViewInNvGLSLVertexShader when the extension is active — without the
+   former the emulation does not run at all (bare gl_ViewID_OVR in the MSL),
+   without the latter the gl_Layer assignment is missing.
+5. The transform ASSERT is extended to MSL output (selectView was
+   GLSL/ESSL-only).
+6. TranslatorMSL: (a) multiview vertex shaders get NO [[point_size]] (Metal
+   forbids point_size together with a specified topology class; layered
+   rendering needs the class — GL_POINTS in multiview FBOs are sacrificed);
+   (b) the internal multiviewBaseViewLayerIndex USER uniform is removed and
+   rewritten to a driver-uniform field — as a user uniform it shifted the
+   MSL block layout against the frontend layout map and all real user
+   uniforms arrived as zero (host repro finding).
+7. DriverUniformMetal: the spare uvec2 is split into
+   multiviewBaseViewIndex(int) + unused(uint), getter; the runtime struct in
+   ContextMtl.h kept in sync.
 
-Verifikation am Host: out/host-Build (target_os=mac) + /tmp/mv4host-Repro —
-LINK+Draw+Readback mit Balkenmuster, Soll aus mapScreenToPhysicalCoordinates.
-Vier echte Defekte wurden ausschliesslich ueber diese Schreibtisch-Schleife
-gefunden (Compile-Option, selectView-Gate, point_size-Kollision,
-User-Uniform-Layout); ein Geraetelauf haette pro Defekt einen Zyklus
-gekostet.
+Verification on the host: out/host build (target_os=mac) + a small repro —
+LINK + draw + readback with a bar pattern, expected values from
+mapScreenToPhysicalCoordinates. Four real defects were found exclusively
+through this desk loop (compile option, selectView gate, point_size collision,
+user-uniform layout); a device run would have cost one cycle per defect.
 
 diff --git a/src/compiler/translator/msl/DriverUniformMetal.cpp b/src/compiler/translator/msl/DriverUniformMetal.cpp
 index 10d08743f9..b7950f5985 100644

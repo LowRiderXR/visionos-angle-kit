@@ -1,43 +1,43 @@
-angle-metal-fixes.patch — generische Fixes fürs ANGLE-Metal-Backend
+angle-metal-fixes.patch — generic fixes for the ANGLE Metal backend
 ====================================================================
-(erarbeitet im Vice-City-Port für visionOS; nicht spielspezifisch)
+(developed in the Vice City port for visionOS; not game-specific)
 
-Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
-Reihenfolge: erst klepton.patch anwenden, dann diesen Patch (git apply).
-Erzeugt:     2026-09-23 aus dem Arbeitsbaum (Tag vc-local-state-20260923
-             im angle-src-Checkout haelt den vollstaendigen Zustand).
+Base:        ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Order:       apply klepton.patch first, then this patch (git apply).
+Created:     2026-09-23 from the working tree (tag vc-local-state-20260923
+             in the angle-src checkout holds the complete state).
 
-Inhalt (vier Gruppen):
+Contents (four groups):
 
-1. GC-Aufschub (Rain+Foveation-Flacker-Fix, PRODUKTIV):
+1. Deferred GC (fix for the rain + foveation flicker, PRODUCTION):
    mtl_buffer_manager.{h,mm}, ContextMtl.{h,mm} —
-   BufferManagers speicherbasierter GC flusht nicht mehr mitten in einem
-   Pass mit Rate Map (Pass-Neustart + Store/Load unter Rate Map = Flackern),
-   sondern wird aufgeschoben und an der Frame-Grenze (ContextMtl::flush ->
-   runPendingGC) nachgeholt. Deckel KL_MTL_GC_DEFER_CAP_MB (Default 256),
-   Aus-Schalter KL_MTL_GC_DEFER=0, Boden-Override KL_MTL_BUFFER_GC_MB.
+   the BufferManager's memory-based GC no longer flushes in the middle of a
+   pass that has a rate map (pass restart + store/load under a rate map =
+   flicker); it is deferred and run at the frame boundary (ContextMtl::flush
+   -> runPendingGC). Cap KL_MTL_GC_DEFER_CAP_MB (default 256), off switch
+   KL_MTL_GC_DEFER=0, floor override KL_MTL_BUFFER_GC_MB.
 
-2. Nicht-Dreieck-Skip unter Rate Map (PRODUKTIV):
-   mtl_command_buffer.{h,mm} — Metal erlaubt unter einer Rasterization Rate
-   Map nur Dreiecke; die draw*-Methoden ueberspringen Linien/Punkte statt
-   abzubrechen. (War vorher nur in angle-build.md erwaehnt, nie gesichert.)
+2. Non-triangle skip under a rate map (PRODUCTION):
+   mtl_command_buffer.{h,mm} — Metal only allows triangles under a
+   rasterization rate map; the draw* methods skip lines/points instead of
+   aborting. (Previously only mentioned in angle-build.md, never saved.)
 
-3. Diagnose-Sonden (nur aktiv mit KL_ANGLE_VRR_TRACE=1, Banner rev=10):
-   mtl_common.mm (Banner), mtl_state_cache.mm (convertToMetalDesc-Trace),
-   ContextMtl.mm (endEncoding/flushCB-Trace mit dladdr),
-   mtl_command_buffer.mm (encode/s-Replay-Timing, cmds/s-Kommandozaehlung,
-   mNumDraws), mtl_buffer_manager.mm (bufferGC-Trace).
+3. Diagnostic probes (active only with KL_ANGLE_VRR_TRACE=1, banner rev=10):
+   mtl_common.mm (banner), mtl_state_cache.mm (convertToMetalDesc trace),
+   ContextMtl.mm (endEncoding/flushCB trace with dladdr),
+   mtl_command_buffer.mm (encode/s replay timing, cmds/s command count,
+   mNumDraws), mtl_buffer_manager.mm (bufferGC trace).
 
-4. Werror-Pragmas (ab Xcode-27-Toolchain noetig):
-   In allen sechs Sonden-Dateien ein datei-lokales
-   "#pragma clang diagnostic ignored -Wunsafe-buffer-usage[-in-libc-call]" —
-   Chromiums unsafe-buffers-Lint macht fprintf sonst zum Error. Bewusst
-   NICHT global (treat_warnings_as_errors bleibt an), siehe BUILD.md Ab. 7.
+4. Werror pragmas (needed from the Xcode 27 toolchain on):
+   a file-local "#pragma clang diagnostic ignored
+   -Wunsafe-buffer-usage[-in-libc-call]" in all six probe files — Chromium's
+   unsafe-buffers lint otherwise turns fprintf into an error. Deliberately
+   NOT global (treat_warnings_as_errors stays on), see BUILD.md section 7.
 
-Hinweis: Der implizite MSAA-Pfad (VC_MSAA_IMPLICIT) haengt von Gruppe 1+2 ab.
-Kleptons physicalPassthrough (Rate-Map-fester Blit) liegt in klepton.patch,
-NICHT hier — und fehlt weiterhin in unresolveIfNeeded (bekannte Luecke,
-siehe Docs/vicecity/multiview-plan.md).
+Note: the implicit MSAA path of the guest (VC_MSAA_IMPLICIT) depends on
+groups 1+2. Klepton's physicalPassthrough (rate-map-aware blit) lives in
+klepton.patch, NOT here — and is still missing in unresolveIfNeeded (known
+gap, documented in the port's private notes).
 
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
 index 4ea4a3cc12..56dbd6ad0c 100644

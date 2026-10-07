@@ -1,34 +1,33 @@
-multiview-stage3.patch — gl_ViewID_OVR/gl_Layer im MSL-Uebersetzer
+multiview-stage3.patch — gl_ViewID_OVR/gl_Layer in the MSL translator
 ===================================================================
-(Stufe 3 des Multiview-Plans, Docs/vicecity/multiview-plan.md;
-Beleg: Docs/vicecity/multiview-stufe3-msl-beleg.md)
+(stage 3 of the multiview plan of the Vice City port)
 
-Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
-Reihenfolge: nach klepton.patch, angle-metal-fixes.patch und
-             multiview-stage2.patch anwenden.
-Stand:       Stufe 3 (2026-09-23), am Schreibtisch verifiziert:
-             Minimal- UND echter librw-Skin-Shader (mit VC-Injektionen)
-             uebersetzen zur Instanz-Emulation, und das erzeugte MSL
-             kompiliert mit xcrun metal fehlerfrei. Laufzeitwirkung erst
-             mit Stufe 4 (Draw-Verdrahtung: Instanzzahl verdoppeln,
-             ANGLE_multiviewBaseViewLayerIndex fuellen).
+Base:        ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Order:       apply after klepton.patch, angle-metal-fixes.patch and
+             multiview-stage2.patch.
+State:       stage 3 (2026-09-23), verified at the desk: both a minimal
+             shader AND the real librw skin shader (with the port's
+             injections) translate to the instanced emulation, and the
+             generated MSL compiles with xcrun metal without errors. Takes
+             effect at runtime only with stage 4 (draw wiring: double the
+             instance count, fill ANGLE_multiviewBaseViewLayerIndex).
 
-Drei Fixes derselben Klasse — Multiview-Symbole entkamen der
-MSL-Pipeline-Sammlung:
+Three fixes of the same class — multiview symbols escaped the MSL pipeline
+collection:
 
-1. TranslatorMSL.cpp: gl_Layer (von der Instanced-Multiview-Emulation
-   geschrieben) wird als Builtin deklariert, sobald es im Baum vorkommt —
-   vorher referenzierte der Emitter ein nie deklariertes Symbol.
-2. Pipeline.cpp: EvqLayerOut wandert ins VertexOut-Struct;
-   EvqEmulatedViewIDOVR (ViewID_OVR) in die NonConstGlobals — sonst
-   mutable Programm-Globale, die Metal ablehnt.
-3. EmitMetal.cpp: gl_Layer bekommt [[render_target_array_index]] und wird
-   als uint32_t deklariert (Metal verlangt unsigned; die int-Zuweisung
-   der Emulation konvertiert implizit).
+1. TranslatorMSL.cpp: gl_Layer (written by the instanced multiview
+   emulation) is declared as a builtin as soon as it appears in the tree —
+   before, the emitter referenced a symbol that was never declared.
+2. Pipeline.cpp: EvqLayerOut moves into the VertexOut struct;
+   EvqEmulatedViewIDOVR (ViewID_OVR) into the NonConstGlobals — otherwise
+   they become mutable program globals, which Metal rejects.
+3. EmitMetal.cpp: gl_Layer gets [[render_target_array_index]] and is
+   declared as uint32_t (Metal requires unsigned; the emulation's int
+   assignment converts implicitly).
 
-Geraete-Vorbedingung (Gate, 2026-09-23, PASS 18/18): Rate Map + Layer-
-Routing per render_target_array_index pro Instanz + memoryless MSAA
-funktionieren zusammen (VC_MV_SPIKE=3, MultiviewSpike.swift).
+Device precondition (gate, 2026-09-23, PASS 18/18): rate map + layer routing
+via render_target_array_index per instance + memoryless MSAA work together
+(VC_MV_SPIKE=3, MultiviewSpike.swift in the app).
 
 diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
 index 014df1fe73..0ed7d55cf6 100644

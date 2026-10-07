@@ -1,69 +1,69 @@
-multiview-stage5.patch — Layered EGLImage-Import, Depth-Array, Pass-Break-Zaehler, Load-Action-Sonde, Frame-GPU-Zeit
+multiview-stage5.patch — layered EGLImage import, depth array, pass-break counter, load-action probe, frame GPU time
 ==================================================================================
-(Stufe 5.0a des Multiview-Plans, Docs/vicecity/multiview-plan.md — GENERISCH,
-keine Spiel-Annahmen; nutzbar von jedem Port, der eine Metal-Array-Textur als
-GL_TEXTURE_2D_ARRAY rendern will)
+(stage 5.0a of the multiview plan of the Vice City port — GENERIC, no game
+assumptions; usable by any port that wants to render a Metal array texture as
+GL_TEXTURE_2D_ARRAY)
 
-Basis:       ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
-Reihenfolge: nach klepton, angle-metal-fixes, multiview-stage2/3/4 anwenden.
-Stand:       5.0a (2026-09-25), am HOST verifiziert (macOS-Metal, Draw+Readback
-             per Metal-Blit): importiertes Private-2DArray + GL-eigenes
-             D24S8-Array, 2x MSAA, 2 Views -> COMPLETE; Depth-Test wirkt in
-             beiden Schichten; Foveation BY IDENTITY auf dem importierten
-             Metal-Objekt trifft direkt. Auf Geraet (Vision Pro M5, visionOS
-             26.6) bestaetigt 2026-09-25: identische Messwerte.
-             Nachtrag 5.0b/4: Baustein 4 (Load-Action-Sonde).
+Base:        ANGLE e4499e6b2835a6996507f1b99920bc56f0122573
+Order:       apply after klepton, angle-metal-fixes, multiview-stage2/3/4.
+State:       5.0a (2026-09-25), verified on the HOST (macOS Metal, draw +
+             readback via Metal blit): imported private 2D array + GL-owned
+             D24S8 array, 2x MSAA, 2 views -> COMPLETE; the depth test works
+             in both layers; foveation BY IDENTITY on the imported Metal
+             object applies directly. Confirmed on the device (Vision Pro M5,
+             visionOS 26.6) 2026-09-25: identical measurements.
+             Addendum 5.0b/4: building block 4 (load-action probe).
 
-Fuenf Bausteine:
+Five building blocks:
 
-1. GL_EXT_EGL_image_array im Metal-Backend (DisplayMtl meldet es; Frontend-
-   Validation existierte bereits). ImageMtl: eine 2D-Array-MTLTexture, die
-   OHNE EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE importiert wird, bleibt ein Array
-   (gl::TextureType::_2DArray) und meldet arrayLength als Tiefe; MIT dem
-   Attribut ist sie wie bisher ein Slice. TextureMtl::setEGLImageTarget nimmt
-   den Array-Typ an und bietet fuer Alt-Importer einen Rueckfall: Array-Image
-   an GL_TEXTURE_2D gebunden = Slice 0 (frueheres Default-Verhalten).
-   Damit gilt: Klepton-Rate-Map by identity auf der Array-Textur registrieren,
-   GL-Array-Objekt drauf, Multiview-FBO — kein Slice-View, kein Umweg.
-2. Depth/Stencil als memoryless MS-Array: kein Code noetig — der 4b-Pfad
-   (MakeMemoryLess2DMSArrayTexture) traegt Depth-Formate; hier NACHGEWIESEN
-   (D24S8-Array via glFramebufferTextureMultisampleMultiviewOVR am
-   GL_DEPTH_STENCIL_ATTACHMENT, Depth-Test korrekt pro Schicht).
-3. Pass-Break-Zaehler (KL_ANGLE_VRR_TRACE): zaehlt pro Frame, wie oft ein
-   rate-gemappter oder layered Pass mit "save content" beendet wurde (= er
-   wird mit Load fortgesetzt; unter Rate Map der Doppelverzerrungs-Pfad).
-   Log bei flush: "[angle-vrr] passBreaks=N". Erwartung pro Frame = Zahl der
-   REGULAEREN Pass-Enden solcher Paesse (typisch 1); mehr = ein Encoder-Wechsel
-   mitten im Pass (Textur-Upload, Mipmap, Query).
+1. GL_EXT_EGL_image_array in the Metal backend (DisplayMtl advertises it;
+   the frontend validation already existed). ImageMtl: a 2D-array MTLTexture
+   imported WITHOUT EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE stays an array
+   (gl::TextureType::_2DArray) and reports arrayLength as depth; WITH the
+   attribute it is a slice as before. TextureMtl::setEGLImageTarget accepts
+   the array type and offers a fallback for old importers: an array image
+   bound to GL_TEXTURE_2D = slice 0 (the previous default behaviour).
+   Result: register the Klepton rate map by identity on the array texture,
+   put a GL array object on it, multiview FBO — no slice view, no detour.
+2. Depth/stencil as a memoryless MS array: no code needed — the 4b path
+   (MakeMemoryLess2DMSArrayTexture) supports depth formats; PROVEN here
+   (D24S8 array via glFramebufferTextureMultisampleMultiviewOVR on
+   GL_DEPTH_STENCIL_ATTACHMENT, depth test correct per layer).
+3. Pass-break counter (KL_ANGLE_VRR_TRACE): counts per frame how often a
+   rate-mapped or layered pass was ended with "save content" (= it continues
+   with Load; under a rate map that is the double-distortion path).
+   Logged at flush: "[angle-vrr] passBreaks=N". Expected per frame = the
+   number of REGULAR pass ends of such passes (typically 1); more = an encoder
+   switch in the middle of a pass (texture upload, mipmap, query).
 
-Host-Test-Hinweis: glReadPixels aus einer importierten PRIVATE-Textur nimmt
-auf macOS ohne das iOS-Feature copyTextureToBufferForReadOptimization den
-CPU-getBytes-Pfad und crasht ("CPU access ... Private ... disallowed") —
-Host-Tests lesen deshalb per Metal-Blit zurueck. Auf Geraet betrifft das
-nichts (Feature aktiv; Compositor liest Metal-seitig).
+Host test note: glReadPixels from an imported PRIVATE texture on macOS,
+without the iOS feature copyTextureToBufferForReadOptimization, takes the CPU
+getBytes path and crashes ("CPU access ... Private ... disallowed") — host
+tests therefore read back via Metal blit. Nothing is affected on the device
+(feature active; the compositor reads on the Metal side).
 
-4. Load-Action-Sonde (KL_ANGLE_VRR_TRACE, mtl_command_buffer.mm): zaehlt fuer
-   jeden Render-Pass mit Rate Map ODER Layer-Rendering die Load-Actions von
-   color0/depth/stencil aus dem KONVERTIERTEN MTLRenderPassDescriptor und
-   druckt sie einmal pro Sekunde neben encode/s:
+4. Load-action probe (KL_ANGLE_VRR_TRACE, mtl_command_buffer.mm): for every
+   render pass with a rate map OR layered rendering, counts the load actions
+   of color0/depth/stencil from the CONVERTED MTLRenderPassDescriptor and
+   prints them once per second next to encode/s:
      [angle-vrr] passLoads/s rate-mapped|layered passes=N color Clear/Load/DontCare=a/b/c depth=... stencil=...
-   Zweck: die Clear-Hygiene eines Gastes messen statt annehmen. Ein Load auf
-   einem memoryless Attachment ist entweder eine geplante Passgrenze (unter
-   Rate Map: doppelt gewarpter Unresolve) oder ein uebersprungener Clear
-   (Schreibmaske/Scissor zur glClear-Zeit). Sollbild fuer einen Augen-/
-   Multiview-Pass: Clear/Clear/Clear, Load = 0.
+   Purpose: measure a guest's clear hygiene instead of assuming it. A Load on
+   a memoryless attachment is either a planned pass boundary (under a rate
+   map: double-warped unresolve) or a skipped clear (write mask/scissor at
+   glClear time). Expected picture for an eye/multiview pass:
+   Clear/Clear/Clear, Load = 0.
 
-5. Frame-GPU-Zeit ohne GL-Query (KL_MTL_FRAME_GPU_TIME=1; mtl_common.h/.mm,
-   ContextMtl.h/.mm): ContextMtl::flush() (= glFlush des Gastes, einer pro
-   Frame) schliesst die laufende TimeElapsed-Entry und oeffnet die naechste;
-   die Entry summiert wie bei GL_TIME_ELAPSED GPUEndTime-GPUStartTime ueber
-   alle Command Buffer des Frames. Fertige Frames liegen in einem Ring, der
-   Gast holt sie per dlsym:
-     extern "C" int ANGLEMetalPopFrameGpuTimeMs(double *outMs);  // 1 = Wert geliefert
-   Zweck: OVR_multiview verbietet eine aktive GL_TIME_ELAPSED-Query waehrend
-   Multiview-Draws (kMultiviewTimerQuery) -- diese Sonde misst identisch,
-   vorher und nachher, ohne Spec-Abweichung. Nicht zusammen mit GL-
-   TimeElapsed-Queries benutzen (beide steuern die eine aktive Entry der
+5. Frame GPU time without a GL query (KL_MTL_FRAME_GPU_TIME=1;
+   mtl_common.h/.mm, ContextMtl.h/.mm): ContextMtl::flush() (= the guest's
+   glFlush, one per frame) closes the running TimeElapsed entry and opens the
+   next one; the entry sums GPUEndTime-GPUStartTime over all command buffers
+   of the frame, like GL_TIME_ELAPSED. Finished frames sit in a ring; the
+   guest fetches them via dlsym:
+     extern "C" int ANGLEMetalPopFrameGpuTimeMs(double *outMs);  // 1 = value delivered
+   Purpose: OVR_multiview forbids an active GL_TIME_ELAPSED query during
+   multiview draws (kMultiviewTimerQuery) — this probe measures identically,
+   before and after, without deviating from the spec. Do not use together
+   with GL TimeElapsed queries (both drive the single active entry of the
    CommandQueue).
 
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
