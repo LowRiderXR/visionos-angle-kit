@@ -112,6 +112,14 @@ ships its own clang in `third_party/llvm-build`; only the SDK headers vary):
 3. Link with the same path substitution, then retarget as in section 4. Only `libGLESv2`
    links the Metal backend — `libEGL` usually stays untouched.
 
+Limits of this route, learned on the multiview stages: it carries changes to **existing**
+files only. It cannot add new source files (no ninja edge exists for them) and it does not
+scale to edits of widely included frontend headers (every includer has to be rebuilt by
+hand; for a Metal-backend header that is all 37 `.mm` files of the backend, which is still
+manageable — for `libANGLE` headers it is not). Before a multi-stage change, run `gn gen`
+against the current SDK as a planned step of its own (section 7) instead of being forced
+into it halfway through a stage.
+
 ## 7. Rebuilding after an Xcode change — Xcode 27 log (2026-09-23)
 
 The first build of ANGLE@e4499e6b28 against the iOS 27.0 SDK produced exactly three
@@ -148,7 +156,30 @@ macOS default may be the native GL backend, which contains none of our patches).
 texts via `GL_KHR_debug`, the runtime MSL via `glGetTranslatedShaderSourceANGLE`. Note:
 `angle_shader_translator` from an iOS out directory is an iOS binary — macOS kills it
 silently with SIGKILL. During stage 4a this loop found four defects that would otherwise
-have cost one device cycle each.
+have cost one device cycle each. Two conventions of the host loop that bite otherwise:
+read back imported `MTLStorageModePrivate` textures with your own Metal blit into a
+shared texture after `glFinish` (never `glReadPixels` — ANGLE's Metal `readPixels` calls
+`getBytes` on the source, which is illegal for private storage on every platform), and
+remember that ANGLE stores framebuffer contents bottom-up while a rasterization rate map
+warps in Metal row order (expected Y of a warped pixel = `phys(height − y)`).
+
+## 9. Build configuration notes
+
+- The shipped frameworks are a plain **release** build: `is_debug=false`,
+  `dcheck_always_on=false`, `angle_assert_always_on=false`, no trace events; defines
+  `NDEBUG`, `NS_BLOCK_ASSERTIONS=1`; `-O2 -fno-exceptions -fno-rtti`. Chromium's hardening
+  stays on (`-ftrivial-auto-var-init=pattern`, `_FORTIFY_SOURCE=3`, `-fstack-protector`,
+  `-fno-omit-frame-pointer`), `is_official_build=false` (no LTO/PGO). Together that is worth
+  single-digit percent at most — if the command replay at the end of a render pass looks
+  expensive, look at the host process first (Metal API validation and the GPU capture
+  wrapper that an IDE injects into a debug launch wrap every Metal call and were measured at
+  ~3 µs per draw; ANGLE's own replay is ≤ 0.2 µs per draw).
+- The diagnostic probes of `angle-metal-fixes.patch` and `multiview-stage5.patch` cost
+  nothing per command when their switches are off: the replay loop contains one
+  `if (klTrace) ++count` per command. `klTrace` is a local `const bool` copied once per pass
+  from `RasterizationRateTraceEnabled()`, which reads `KL_ANGLE_VRR_TRACE` from the
+  environment exactly once per process (function-local static). The pass-load counting is
+  per pass, the frame GPU time per command buffer.
 
 ## Runtime switches of the patches
 

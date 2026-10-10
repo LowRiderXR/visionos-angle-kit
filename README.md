@@ -29,11 +29,23 @@ patches and the build configuration. The procedure is in [BUILD.md](BUILD.md).
 - Used by: [revc-visionos-app](https://github.com/LowRiderXR/revc-visionos-app)
   (Xcode project `AvpViceCity`; it links the prebuilt xcframeworks from
   `ThirdParty/ANGLE/`, which are attached to its GitHub releases and downloaded with
-  checksums by its `setup.sh`). On the development machine `Prototypes/angle-patches/`
-  is a symlink to `patches/` here.
-- Every release of the app carries the same tag in this repository (`v1.0-rc1` …), so the
+  checksums by its `setup.sh`).
+- Every release of the app carries the same tag in this repository (`v1.0` …), so the
   patch state that produced the shipped frameworks can always be found.
 
-Project-specific background (measurements, decision records) lives in the private docs
-repository `visionos-ports-docs`; this repository is deliberately kept free of it so it can
-be published and given back to Klepton.
+## What the patches require from the guest
+
+Rules that follow from the patches and from ANGLE's own validation; each one cost a device
+cycle or a host debugging session to find.
+
+| Patch | Rule for the GL client |
+|---|---|
+| `klepton.patch` | Only triangles are drawn under a rasterization rate map; lines and points are skipped (the Metal validation layer reports "only triangles may be drawn when using a rasterization rate map", `MTLDebugRenderCommandEncoder`; without validation the behaviour is undefined). A rate map registered by texture identity also applies to a 2D-array texture imported through `multiview-stage5.patch` (same `MTLTexture`, no view). |
+| `angle-metal-fixes.patch` | Never start a pass on an implicit-MSAA (memoryless) attachment with `loadAction=Load` while a rate map is active: ANGLE reconstructs the content with an unresolve blit that is **not** rate-map aware, so the result is warped twice. That includes forced pass breaks (texture upload, `glGenerateMipmap`, queries in the middle of a pass) — count them with `passBreaks` under `KL_ANGLE_VRR_TRACE=1`, target 0 per frame in the game pass. |
+| `multiview-stage2.patch` | Nothing changes without `KL_GL_MULTIVIEW=1`. With it, a multiview attachment on a 2D-array texture is accepted as is. |
+| `multiview-stage3.patch` | Multiview vertex shaders must not write `gl_PointSize` (Metal forbids `[[point_size]]` once the pipeline carries a topology class, and layered rendering needs that class); points and lines into a multiview FBO are skipped. |
+| `multiview-stage4.patch` | ANGLE checks `layout(num_views = N)` of the program against the views of the bound framebuffer for **equality**: a `num_views = 2` program cannot draw into a single-view FBO (HUD, shadow cameras, menus) and a mono program cannot draw into the multiview FBO — keep a mono and a multiview variant of every shader that runs on the multiview FBO and select at the actual framebuffer bind. Clears must be real load actions: before `glClear` set full color/depth/stencil write masks and disable the scissor, otherwise the clear becomes a draw and memoryless attachments start with garbage per layer. The explicit MSAA path (shared multisample renderbuffer + blit resolve per eye) is incompatible with a two-layer target — use `OVR_multiview_multisampled_render_to_texture`. |
+| `multiview-stage5.patch` | No `GL_TIME_ELAPSED` query may be active while drawing into a multiview FBO (spec rule, enforced: every draw returns `INVALID_OPERATION`); measure GPU time with `KL_MTL_FRAME_GPU_TIME=1` / `ANGLEMetalPopFrameGpuTimeMs` instead, and not together with GL timer queries. Never `glReadPixels` from an imported private texture — read back with your own Metal blit into a shared texture after `glFinish`. |
+
+Project-specific measurements and decision records are kept outside this repository, so it
+can be published and given back to Klepton.

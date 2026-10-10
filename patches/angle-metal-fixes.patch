@@ -37,7 +37,8 @@ Contents (four groups):
 Note: the implicit MSAA path of the guest (VC_MSAA_IMPLICIT) depends on
 groups 1+2. Klepton's physicalPassthrough (rate-map-aware blit) lives in
 klepton.patch, NOT here — and is still missing in unresolveIfNeeded (known
-gap, documented in the port's private notes).
+gap; consequence for guests: never start a pass on a memoryless MSAA
+attachment with loadAction=Load under a rate map, see README).
 
 diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
 index 4ea4a3cc12..56dbd6ad0c 100644
